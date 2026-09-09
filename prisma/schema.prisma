@@ -1,0 +1,510 @@
+// Taskeer — esquema de base de datos (MySQL vía Prisma)
+//
+// Decisiones de diseño (ver planeación en el chat):
+// - IDs públicos como UUID en vez de enteros autoincrementales, para evitar
+//   enumeración de recursos. Prisma genera UUID v4 por defecto con @default(uuid());
+//   para producción se recomienda sustituirlo por UUID v7 (time-ordered, mejor para
+//   índices B-tree en MySQL) generado en la capa de servicio con el paquete `uuidv7`
+//   y pasado explícitamente al crear el registro, en vez de depender del default.
+// - Slugs en Workspace y Board para URLs amigables/compartibles; nunca se usan
+//   como FK interna, solo como identificador público adicional.
+// - Soft delete (`deletedAt`) en Workspace/Board/Task para recuperación y para
+//   poder cumplir borrado real diferido (retención + purga) sin perder auditoría.
+// - AuditLog para eventos de seguridad (login, cambios de rol, borrados), separado
+//   de los logs de aplicación.
+// - Índices pensados para las consultas más frecuentes: pertenencia a workspace,
+//   orden del kanban (position), y el polling de recordatorios pendientes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  DISMISSED
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum InterfaceTheme {
+  LIGHT
+  DARK
+  AUTO
+}
+
+model UserPreferences {
+  id         String         @id @default(uuid()) @db.Char(36)
+  userId     String         @unique @db.Char(36)
+  countryId  Int?
+  timezoneId Int?
+  // AUTO sigue la configuración del sistema operativo/navegador del usuario.
+  theme      InterfaceTheme @default(AUTO)
+  // ISO 639-1. Placeholder para cuando Taskeer soporte más de un idioma de interfaz.
+  language   String         @default("es") @db.Char(2)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  country  Country?  @relation(fields: [countryId], references: [id], onDelete: SetNull)
+  timezone Timezone? @relation(fields: [timezoneId], references: [id], onDelete: SetNull)
+
+  @@map("user_preferences")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+// Catálogo estático (205 países, tomado de un dataset ISO 3166-1 alpha-2 existente).
+// Entero autoincremental a propósito, no UUID: es un catálogo de referencia público,
+// no hay nada sensible que enumerar.
+model Country {
+  id        Int      @id @default(autoincrement())
+  isoCode   String   @unique @db.Char(2)
+  name      String   @db.VarChar(100)
+  flagEmoji String?  @db.VarChar(16)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  preferences UserPreferences[]
+
+  @@index([isoCode])
+  @@map("countries")
+}
+
+// Catálogo estático (24 zonas horarias con offset fijo). El id es manual y curado
+// (no autoincrement) porque el origen (data.sql) lo trae así — se preserva tal cual.
+model Timezone {
+  id          Int      @id
+  ianaName    String   @unique @db.VarChar(50)
+  utcOffset   Decimal  @db.Decimal(3, 1)
+  displayName String   @db.VarChar(100)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  preferences UserPreferences[]
+
+  @@index([ianaName])
+  @@map("timezones")
+}
+
+model User {
+  id              String    @id @default(uuid()) @db.Char(36)
+  email           String    @unique @db.VarChar(255)
+  passwordHash    String    @db.VarChar(255)
+  displayName     String    @db.VarChar(100)
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  memberships       WorkspaceMember[]
+  assignedTasks     Task[]             @relation("TaskAssignee")
+  pushSubscriptions PushSubscription[]
+  auditLogs         AuditLog[]
+  authTokens        AuthToken[]
+  recoveryCodes     RecoveryCode[]
+  refreshTokens     RefreshToken[]
+  sentInvitations   Invitation[]       @relation("InvitationsSent")
+  notifications     Notification[]
+  preferences       UserPreferences?
+  subscription      Subscription?
+
+  @@map("users")
+}
+
+enum NotificationType {
+  REMINDER
+  INVITATION
+  ROLE_CHANGED
+  MENTION
+  // Se usó uno de los 10 códigos de recuperación de la cuenta — ver
+  // "Recuperación de contraseña" en docs/03-autenticacion-seguridad.md.
+  // Aviso al dueño; no bloquea el reset, se dispara después.
+  RECOVERY_CODE_USED
+  // Alguien te asignó una tarea a ti (nunca se dispara si te la asignas a
+  // ti mismo — ver tasks.service.ts, createTask/updateTask).
+  TASK_ASSIGNED
+}
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Char(36)
+  userId    String           @db.Char(36)
+  type      NotificationType
+  title     String           @db.VarChar(200)
+  body      String?          @db.VarChar(500)
+  taskId    String?          @db.Char(36)
+  // null = no leída. El "centro de notificaciones" del frontend filtra por esto.
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task Task? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  // Consulta típica al abrir la app: notificaciones no leídas de este usuario, más recientes primero.
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Char(36)
+  userId     String    @db.Char(36)
+  // Igual que AuthToken: se guarda el hash, nunca el token en texto plano.
+  tokenHash  String    @unique @db.Char(64)
+  userAgent  String?   @db.VarChar(255)
+  ipAddress  String?   @db.VarChar(45)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Permite listar "sesiones activas" de un usuario y revocarlas todas de un
+  // golpe al hacer reset de contraseña o "cerrar sesión en todos los dispositivos".
+  @@index([userId, revokedAt])
+  @@map("refresh_tokens")
+}
+
+model AuthToken {
+  id        String        @id @default(uuid()) @db.Char(36)
+  userId    String        @db.Char(36)
+  type      AuthTokenType
+  // Nunca se guarda el token en texto plano: se hashea (SHA-256) igual que una
+  // contraseña de un solo uso. Si la base de datos se filtra, los enlaces de
+  // verificación/reset ya emitidos siguen siendo inutilizables.
+  tokenHash String        @unique @db.Char(64)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Consulta típica al validar un enlace: por hash exacto, filtrando ya usados/expirados.
+  // NOTA: el tipo PASSWORD_RESET queda sin usar activamente desde que el reset de
+  // contraseña se resolvió con RecoveryCode (no depende de correo). Se conserva el
+  // enum por si en el futuro se agrega un canal por correo como alternativa adicional
+  // — no lo elimines ni lo reutilices para otra cosa sin revisar docs/03-autenticacion-seguridad.md.
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+// Códigos de recuperación de un solo uso — el método real de "olvidé mi
+// contraseña" de Taskeer, sin depender de correo ni de ningún servicio externo.
+// Ver "Recuperación de contraseña" en docs/03-autenticacion-seguridad.md para
+// el flujo completo (generación, consumo, regeneración, notificación de uso).
+model RecoveryCode {
+  id     String @id @default(uuid()) @db.Char(36)
+  userId String @db.Char(36)
+  // Igual que el resto de tokens: solo se guarda el hash, nunca el código en
+  // texto plano. El código en sí solo existe en pantalla una vez, al generarse.
+  codeHash String @unique @db.Char(64)
+  // null = no usado todavía. Nunca se borra la fila al usarse — se marca, para
+  // poder auditar cuál de los 10 códigos se consumió y cuándo.
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Consulta típica: códigos sin usar de un usuario, para saber cuántos le quedan.
+  @@index([userId, usedAt])
+  @@map("recovery_codes")
+}
+
+model Workspace {
+  id        String    @id @default(uuid()) @db.Char(36)
+  name      String    @db.VarChar(150)
+  slug      String    @unique @db.VarChar(160)
+  ownerId   String    @db.Char(36)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  members WorkspaceMember[]
+  boards  Board[]
+  invitations Invitation[]
+
+  @@index([ownerId])
+  @@map("workspaces")
+}
+
+model Invitation {
+  id          String            @id @default(uuid()) @db.Char(36)
+  workspaceId String            @db.Char(36)
+  // El invitado puede no tener cuenta todavía — se invita por correo, no por userId.
+  email       String            @db.VarChar(255)
+  role        WorkspaceRole     @default(EDITOR)
+  // Mismo patrón que AuthToken: solo se guarda el hash del token de la invitación.
+  tokenHash   String            @unique @db.Char(64)
+  invitedById String            @db.Char(36)
+  status      InvitationStatus  @default(PENDING)
+  expiresAt   DateTime
+  createdAt   DateTime          @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User      @relation("InvitationsSent", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  // Consulta típica: invitaciones pendientes de un workspace, o buscar por correo
+  // al momento en que alguien se registra con un correo que tiene invitaciones esperando.
+  @@index([workspaceId, status])
+  @@index([email])
+  @@map("invitations")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Char(36)
+  workspaceId String        @db.Char(36)
+  userId      String        @db.Char(36)
+  role        WorkspaceRole @default(EDITOR)
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Evita membresías duplicadas y resuelve "¿pertenece este usuario a este
+  // workspace?" en un solo lookup indexado — se consulta en cada request autenticado.
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model Board {
+  id          String    @id @default(uuid()) @db.Char(36)
+  workspaceId String    @db.Char(36)
+  name        String    @db.VarChar(150)
+  slug        String    @db.VarChar(160)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns   Column[]
+
+  // El slug es único dentro de su workspace, no globalmente — permite URLs
+  // tipo /w/mi-equipo/b/sprint-actual sin coordinar slugs entre workspaces distintos.
+  @@unique([workspaceId, slug])
+  @@index([workspaceId])
+  @@map("boards")
+}
+
+model Column {
+  id        String   @id @default(uuid()) @db.Char(36)
+  boardId   String   @db.Char(36)
+  name      String   @db.VarChar(100)
+  position  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  @@index([boardId, position])
+  @@map("columns")
+}
+
+model Task {
+  id          String    @id @default(uuid()) @db.Char(36)
+  columnId    String    @db.Char(36)
+  assigneeId  String?   @db.Char(36)
+  title       String    @db.VarChar(200)
+  description String?   @db.Text
+  dueAt       DateTime?
+  position    Int
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  column    Column     @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  // Si se borra el usuario asignado, la tarea sobrevive sin asignar en vez de
+  // desaparecer o bloquear el borrado del usuario.
+  assignee  User?      @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  reminders     Reminder[]
+  notifications Notification[]
+
+  @@index([columnId, position])
+  @@index([assigneeId])
+  @@index([dueAt])
+  @@map("tasks")
+}
+
+model Reminder {
+  id        String         @id @default(uuid()) @db.Char(36)
+  taskId    String         @db.Char(36)
+  remindAt  DateTime
+  status    ReminderStatus @default(PENDING)
+  sentAt    DateTime?
+  createdAt DateTime       @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Índice pensado exactamente para la query del worker:
+  // WHERE status = 'PENDING' AND remindAt <= NOW()
+  @@index([status, remindAt])
+  @@map("reminders")
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid()) @db.Char(36)
+  userId    String   @db.Char(36)
+  endpoint  String   @unique @db.VarChar(500)
+  p256dhKey String   @db.VarChar(255)
+  authKey   String   @db.VarChar(255)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Char(36)
+  userId    String?  @db.Char(36)
+  action    String   @db.VarChar(100) // ej. "auth.login", "workspace.role_changed", "board.deleted"
+  metadata  Json?
+  ipAddress String?  @db.VarChar(45)
+  createdAt DateTime @default(now())
+
+  // SetNull en vez de Cascade: si se borra la cuenta, el registro de auditoría
+  // permanece (útil legal y operativamente) pero sin vincular a un usuario ya inexistente.
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Planes y suscripciones
+//
+// Regla de diseño central: NINGÚN límite ni feature de un plan se hardcodea
+// en el código de la aplicación (nada de "if (plan === 'FREE') maxWorkspaces = 3").
+// Todo vive en `PlanEntitlement` como pares clave/valor. Agregar un plan nuevo,
+// o cambiar un límite existente, es una operación de datos — no requiere
+// desplegar código ni migrar el schema. Solo introducir una clave *nueva* que
+// el código todavía no entiende requiere trabajo de desarrollo; cambiar el
+// valor de una clave existente para un plan, no.
+//
+// Ver docs/08-planes-suscripciones.md para el catálogo completo de claves,
+// los valores iniciales de cada plan, y la política de periodo de gracia al
+// bajar de plan.
+// ---------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+}
+
+model Plan {
+  id                String   @id @default(uuid()) @db.Char(36)
+  // Identificador estable usado por el código para referirse a un plan conocido
+  // (ej. asignar FREE en el registro). String, no enum — agregar un plan nuevo
+  // no debe requerir una migración de schema.
+  code              String   @unique @db.VarChar(30)
+  name              String   @db.VarChar(100)
+  description       String?  @db.VarChar(300)
+  // null = sin precio fijo listado (plan Business, negociado por caso).
+  priceMonthlyCents Int?
+  isCustomPricing   Boolean  @default(false)
+  sortOrder         Int      @default(0)
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  entitlements         PlanEntitlement[]
+  subscriptionsCurrent  Subscription[] @relation("CurrentPlan")
+  subscriptionsPrevious Subscription[] @relation("PreviousPlan")
+
+  @@map("plans")
+}
+
+model PlanEntitlement {
+  id     String @id @default(uuid()) @db.Char(36)
+  planId String @db.Char(36)
+  // Clave namespaced, ej. "storage.personal.enabled", "workspaces.owned.max".
+  key    String @db.VarChar(100)
+  // Siempre texto: "true"/"false" para flags, un entero como string para
+  // límites numéricos, o el valor sentinela "unlimited". El significado de
+  // cada clave está documentado en docs/08-planes-suscripciones.md, no en
+  // el tipo de columna.
+  value  String @db.VarChar(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, key])
+  @@map("plan_entitlements")
+}
+
+model Subscription {
+  id     String @id @default(uuid()) @db.Char(36)
+  userId String @unique @db.Char(36)
+  planId String @db.Char(36)
+
+  status           SubscriptionStatus @default(ACTIVE)
+  currentPeriodEnd DateTime?
+  canceledAt       DateTime?
+
+  // Periodo de gracia de 24h tras una baja de plan: mientras
+  // `downgradeGraceEndsAt` sea una fecha futura, los entitlements efectivos
+  // se resuelven contra `previousPlanId` (el plan más generoso), no contra
+  // `planId`. Al vencer, un proceso del worker limpia ambos campos y desde
+  // ahí se aplican los límites del plan nuevo — sin borrar ni ocultar nada
+  // que el usuario ya tuviera creado, solo bloqueando acciones nuevas que
+  // excedan el límite.
+  previousPlanId       String?   @db.Char(36)
+  downgradeGraceEndsAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Restrict, no Cascade: no debe poder borrarse un Plan que todavía tiene
+  // suscripciones activas apuntándole — hay que migrar a esos usuarios primero.
+  plan         Plan    @relation("CurrentPlan", fields: [planId], references: [id], onDelete: Restrict)
+  previousPlan Plan?   @relation("PreviousPlan", fields: [previousPlanId], references: [id], onDelete: SetNull)
+
+  overrides SubscriptionEntitlementOverride[]
+
+  @@index([planId])
+  @@index([downgradeGraceEndsAt])
+  @@map("subscriptions")
+}
+
+model SubscriptionEntitlementOverride {
+  id             String  @id @default(uuid()) @db.Char(36)
+  subscriptionId String  @db.Char(36)
+  key            String  @db.VarChar(100)
+  value          String  @db.VarChar(100)
+  // Por qué existe este override — obligatorio en la práctica para cuentas
+  // Business, donde todo el punto es la personalización caso por caso.
+  note           String? @db.VarChar(300)
+
+  createdAt DateTime @default(now())
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@unique([subscriptionId, key])
+  @@map("subscription_entitlement_overrides")
+}
