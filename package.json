@@ -7,10 +7,11 @@
     "dev": "tsx watch src/server.ts",
     "build": "prisma generate && tsc -p tsconfig.json",
     "postinstall": "prisma generate",
-    "start": "node dist/server.js",
+    "start": "tsx scripts/with-database-url.ts migrate deploy && node dist/server.js",
     "lint": "eslint src --ext .ts",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate": "tsx scripts/with-database-url.ts migrate dev",
+    "prisma:studio": "tsx scripts/with-database-url.ts studio",
     "prisma:seed": "tsx prisma/seed.ts"
   },
   "prisma": {

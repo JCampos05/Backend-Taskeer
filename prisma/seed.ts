@@ -1,8 +1,11 @@
 import { PrismaClient } from '@prisma/client';
+import { buildDatabaseUrl } from '../src/config/database-url';
 import { countries, timezones } from './seed-data';
 import { plans } from './plans-seed-data';
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  datasources: { db: { url: buildDatabaseUrl() } },
+});
 
 async function main() {
   console.log(`Sembrando ${timezones.length} zonas horarias...`);

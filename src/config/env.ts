@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { buildDatabaseUrl } from './database-url';
 
 function required(name: string): string {
   const value = process.env[name];
@@ -11,7 +12,7 @@ function required(name: string): string {
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: Number(process.env.PORT ?? 3000),
-  databaseUrl: required('DATABASE_URL'),
+  databaseUrl: buildDatabaseUrl(),
   jwtSecret: required('JWT_SECRET'),
   jwtAccessTokenTtl: process.env.JWT_ACCESS_TOKEN_TTL ?? '15m',
   refreshTokenCookieName: process.env.REFRESH_TOKEN_COOKIE_NAME ?? 'taskeer_refresh',
