@@ -2,7 +2,9 @@ import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import type { CreateReminderInput } from './reminders.schema';
-import type { ReminderDto } from './reminders.types';
+import type { ReminderDto, UpcomingReminderDto } from './reminders.types';
+
+const UPCOMING_REMINDERS_LIMIT = 5;
 
 // Reminder cuelga de Task y no tiene reglas de permiso propias — hereda
 // exactamente los mismos permisos que mutar/leer la tarea a la que
@@ -155,8 +157,53 @@ async function cancelReminder(reminderId: string, userId: string): Promise<Remin
   return toReminderDto(updated);
 }
 
+/** Para el dashboard de Inicio — los próximos recordatorios de tareas
+ * asignadas al usuario, cruzando todos sus workspaces (a diferencia de
+ * listRemindersByTask, que es de una sola tarea). Filtra por membresía
+ * vigente además de `assigneeId`: si a alguien lo sacaron de un workspace
+ * después de que le asignaran una tarea ahí, esa asignación queda huérfana
+ * en el modelo (no hay limpieza automática) y no debería seguir apareciendo
+ * en su propio dashboard. */
+async function listUpcomingForUser(userId: string): Promise<UpcomingReminderDto[]> {
+  const reminders = await prisma.reminder.findMany({
+    where: {
+      status: 'PENDING',
+      task: {
+        assigneeId: userId,
+        deletedAt: null,
+        column: {
+          board: {
+            deletedAt: null,
+            workspace: { members: { some: { userId } } },
+          },
+        },
+      },
+    },
+    orderBy: { remindAt: 'asc' },
+    take: UPCOMING_REMINDERS_LIMIT,
+    include: {
+      task: {
+        select: {
+          id: true,
+          title: true,
+          column: { select: { board: { select: { id: true, name: true, workspaceId: true } } } },
+        },
+      },
+    },
+  });
+
+  return reminders.map((reminder) => ({
+    id: reminder.id,
+    remindAt: reminder.remindAt.toISOString(),
+    task: { id: reminder.task.id, title: reminder.task.title },
+    board: { id: reminder.task.column.board.id, name: reminder.task.column.board.name },
+    workspaceId: reminder.task.column.board.workspaceId,
+  }));
+}
+
 export const remindersService = {
   createReminder,
   listRemindersByTask,
   cancelReminder,
+  listUpcomingForUser,
 };

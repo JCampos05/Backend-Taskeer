@@ -60,6 +60,29 @@ export const regenerateRecoveryCodesSchema = z.object({
   }),
 });
 
+export const changePasswordSchema = z.object({
+  body: z.object({
+    currentPassword: z.string().min(1, 'La contraseña actual es obligatoria.'),
+    newPassword: z
+      .string()
+      .min(8, 'La contraseña debe tener al menos 8 caracteres.')
+      .max(128, 'La contraseña es demasiado larga.'),
+  }),
+});
+
+export const googleLoginSchema = z.object({
+  body: z.object({
+    // JWT de sesión que Supabase Auth le entrega al frontend tras el login
+    // con Google — se verifica su firma en auth.service.ts, nunca se confía
+    // en su contenido antes de eso.
+    supabaseAccessToken: z.string().min(1, 'Falta el token de Supabase.'),
+    // Nonce anti-CSRF — se compara contra la cookie taskeer_oauth_state en
+    // el controller (no acá, Zod no tiene acceso a cookies), antes de tocar
+    // authService.loginWithGoogle.
+    state: z.string().min(1, 'Falta el parámetro de estado.'),
+  }),
+});
+
 export const updateProfileSchema = z.object({
   body: z.object({
     displayName: z
@@ -70,9 +93,11 @@ export const updateProfileSchema = z.object({
   }),
 });
 
+export type GoogleLoginInput = z.infer<typeof googleLoginSchema>['body'];
 export type RegisterInput = z.infer<typeof registerSchema>['body'];
 export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>['query'];
 export type LoginInput = z.infer<typeof loginSchema>['body'];
 export type ResetPasswordWithCodeInput = z.infer<typeof resetPasswordWithCodeSchema>['body'];
 export type RegenerateRecoveryCodesInput = z.infer<typeof regenerateRecoveryCodesSchema>['body'];
+export type ChangePasswordInput = z.infer<typeof changePasswordSchema>['body'];
 export type UpdateProfileInput = z.infer<typeof updateProfileSchema>['body'];

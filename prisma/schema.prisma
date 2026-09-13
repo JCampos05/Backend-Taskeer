@@ -110,7 +110,11 @@ model Timezone {
 model User {
   id              String    @id @default(uuid()) @db.Char(36)
   email           String    @unique @db.VarChar(255)
-  passwordHash    String    @db.VarChar(255)
+  // Opcional a propósito: una cuenta que solo entra por Google (OAuthIdentity)
+  // nunca tiene contraseña propia. Si es null, el login local por
+  // email+contraseña debe rechazarse explícitamente, no fallar por un hash
+  // vacío comparado a ciegas.
+  passwordHash    String?   @db.VarChar(255)
   displayName     String    @db.VarChar(100)
   emailVerifiedAt DateTime?
   createdAt       DateTime  @default(now())
@@ -118,6 +122,8 @@ model User {
 
   memberships       WorkspaceMember[]
   assignedTasks     Task[]             @relation("TaskAssignee")
+  assignedSubtasks  Subtask[]          @relation("SubtaskAssignee")
+  boardRoleOverrides BoardMemberOverride[]
   pushSubscriptions PushSubscription[]
   auditLogs         AuditLog[]
   authTokens        AuthToken[]
@@ -127,8 +133,38 @@ model User {
   notifications     Notification[]
   preferences       UserPreferences?
   subscription      Subscription?
+  oauthIdentities   OAuthIdentity[]
+  attachments       Attachment[]
 
   @@map("users")
+}
+
+enum OAuthProvider {
+  GOOGLE
+}
+
+// Identidad de un proveedor externo vinculada a un User. Separado de User en
+// vez de un simple `googleId` en la tabla, para no rehacer el schema si mañana
+// se agrega otro proveedor (Apple, GitHub, etc.) — agregar uno nuevo es una
+// fila más en este enum, no una columna nueva en User.
+model OAuthIdentity {
+  id       String        @id @default(uuid()) @db.Char(36)
+  userId   String        @db.Char(36)
+  provider OAuthProvider
+  // El "sub" que entrega el proveedor (vía Supabase Auth) — estable aunque el
+  // usuario cambie su email en Google, a diferencia de guardar el email como
+  // identificador.
+  providerUserId String  @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Un mismo (provider, providerUserId) nunca puede pertenecer a dos User
+  // distintos — es la identidad real de la persona en ese proveedor.
+  @@unique([provider, providerUserId])
+  @@index([userId])
+  @@map("oauth_identities")
 }
 
 enum NotificationType {
@@ -228,6 +264,45 @@ model RecoveryCode {
   @@map("recovery_codes")
 }
 
+enum AttachmentScope {
+  PERSONAL
+  WORKSPACE
+}
+
+// Metadatos de un archivo — el archivo en sí (los bytes) vive en Supabase
+// Storage, nunca en MySQL. Esta fila es lo que permite calcular cuánto
+// espacio ha usado alguien (contra su cuota de plan) sin tener que preguntarle
+// a Supabase cada vez, y lo que sobrevive si algún día se cambia de proveedor
+// de storage — solo cambiaría cómo se interpreta `storageKey`.
+model Attachment {
+  id          String          @id @default(uuid()) @db.Char(36)
+  uploaderId  String          @db.Char(36)
+  // PERSONAL = cuenta contra la cuota personal del uploader, solo él lo ve.
+  // WORKSPACE = cuenta contra la cuota del OWNER del workspace, ver
+  // "Quién manda en un workspace compartido" en 08-planes-suscripciones.md.
+  scope       AttachmentScope
+  workspaceId String?         @db.Char(36)
+  taskId      String?         @db.Char(36)
+  // Ruta/key dentro del bucket de Supabase Storage. Nunca se guarda el
+  // archivo ni su contenido en esta base de datos.
+  storageKey  String          @db.VarChar(500)
+  fileName    String          @db.VarChar(255)
+  mimeType    String          @db.VarChar(150)
+  sizeBytes   Int
+  createdAt   DateTime        @default(now())
+  deletedAt   DateTime?
+
+  uploader  User       @relation(fields: [uploaderId], references: [id], onDelete: Cascade)
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  task      Task?      @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  // Consulta típica: sumar sizeBytes de un uploader (o de un workspace) sin
+  // borrar, para comparar contra la cuota del plan antes de aceptar una subida nueva.
+  @@index([uploaderId, scope, deletedAt])
+  @@index([workspaceId, deletedAt])
+  @@map("attachments")
+}
+
 model Workspace {
   id        String    @id @default(uuid()) @db.Char(36)
   name      String    @db.VarChar(150)
@@ -237,9 +312,10 @@ model Workspace {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  members WorkspaceMember[]
-  boards  Board[]
+  members     WorkspaceMember[]
+  boards      Board[]
   invitations Invitation[]
+  attachments Attachment[]
 
   @@index([ownerId])
   @@map("workspaces")
@@ -294,8 +370,9 @@ model Board {
   updatedAt   DateTime  @updatedAt
   deletedAt   DateTime?
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  columns   Column[]
+  workspace      Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns        Column[]
+  memberOverrides BoardMemberOverride[]
 
   // El slug es único dentro de su workspace, no globalmente — permite URLs
   // tipo /w/mi-equipo/b/sprint-actual sin coordinar slugs entre workspaces distintos.
@@ -304,11 +381,44 @@ model Board {
   @@map("boards")
 }
 
+// Rol efectivo de un miembro del workspace DENTRO de un board puntual —
+// reemplaza (no combina) su WorkspaceMember.role mientras exista esta fila,
+// en ambas direcciones (puede subir o bajar el rol efectivo, confirmado con
+// el usuario) y para TODO lo que ese rol habilita en ese board — incluida
+// la gestión de columnas, hoy normalmente exclusiva de OWNER/ADMIN del
+// workspace (de facto, un override a OWNER/ADMIN acá crea un "admin de
+// tablero" para ESE board puntual — decisión explícita del usuario, no un
+// efecto secundario no buscado).
+//
+// Solo lo puede crear/editar/borrar el OWNER/ADMIN del *workspace* (nunca
+// un "admin de tablero" vía su propio override — ver
+// boards.service.ts::requireOwnerOrAdmin, que para gestionar overrides usa
+// siempre el rol de WorkspaceMember crudo, nunca el rol efectivo).
+model BoardMemberOverride {
+  id        String        @id @default(uuid()) @db.Char(36)
+  boardId   String        @db.Char(36)
+  userId    String        @db.Char(36)
+  role      WorkspaceRole
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  board Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([boardId, userId])
+  @@index([userId])
+  @@map("board_member_overrides")
+}
+
 model Column {
   id        String   @id @default(uuid()) @db.Char(36)
   boardId   String   @db.Char(36)
   name      String   @db.VarChar(100)
   position  Int
+  // Límite de tareas simultáneas (no borradas) en esta columna — null =
+  // ilimitado. Configurable por OWNER/ADMIN del workspace, igual que el
+  // resto de columna/board (docs/07-alcance-mvp.md, "Kanban").
+  wipLimit  Int?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -319,16 +429,26 @@ model Column {
   @@map("columns")
 }
 
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
 model Task {
-  id          String    @id @default(uuid()) @db.Char(36)
-  columnId    String    @db.Char(36)
-  assigneeId  String?   @db.Char(36)
-  title       String    @db.VarChar(200)
-  description String?   @db.Text
+  id          String       @id @default(uuid()) @db.Char(36)
+  columnId    String       @db.Char(36)
+  assigneeId  String?      @db.Char(36)
+  title       String       @db.VarChar(200)
+  description String?      @db.Text
   dueAt       DateTime?
+  // Reintroducido de una versión alpha anterior de Taskeer — reemplaza la
+  // idea de swimlanes que se había planteado (el usuario prefirió esto).
+  priority    TaskPriority @default(MEDIUM)
   position    Int
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
   deletedAt   DateTime?
 
   column    Column     @relation(fields: [columnId], references: [id], onDelete: Cascade)
@@ -337,11 +457,41 @@ model Task {
   assignee  User?      @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   reminders     Reminder[]
   notifications Notification[]
+  attachments   Attachment[]
+  subtasks      Subtask[]
 
   @@index([columnId, position])
   @@index([assigneeId])
   @@index([dueAt])
   @@map("tasks")
+}
+
+// Paso/checklist dentro de una Task — se puede marcar completado
+// independientemente de en qué columna esté la tarea (ej. columna
+// "Terminado"). Deliberadamente sin `deletedAt` propio, mismo criterio que
+// Column (ver arriba): es un hijo desechable de Task, se borra físicamente
+// tal cual, y desaparece igual si la Task dueña queda soft-deleted (Task ya
+// se considera inexistente en ese caso, sin que haga falta cascadear el
+// estado acá).
+model Subtask {
+  id         String    @id @default(uuid()) @db.Char(36)
+  taskId     String    @db.Char(36)
+  assigneeId String?   @db.Char(36)
+  title      String    @db.VarChar(200)
+  dueAt      DateTime?
+  completed  Boolean   @default(false)
+  position   Int
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  task     Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // Mismo criterio que Task.assignee: si se borra el usuario, la subtarea
+  // sobrevive sin asignar.
+  assignee User? @relation("SubtaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, position])
+  @@index([assigneeId])
+  @@map("subtasks")
 }
 
 model Reminder {
@@ -443,9 +593,9 @@ model PlanEntitlement {
   // Clave namespaced, ej. "storage.personal.enabled", "workspaces.owned.max".
   key    String @db.VarChar(100)
   // Siempre texto: "true"/"false" para flags, un entero como string para
-  // límites numéricos, o el valor sentinela "unlimited". El significado de
-  // cada clave está documentado en docs/08-planes-suscripciones.md, no en
-  // el tipo de columna.
+  // límites numéricos (incluye MB de storage, ver docs/08-planes-suscripciones.md),
+  // o el valor sentinela "unlimited". El significado de cada clave está
+  // documentado en docs/08-planes-suscripciones.md, no en el tipo de columna.
   value  String @db.VarChar(100)
 
   createdAt DateTime @default(now())

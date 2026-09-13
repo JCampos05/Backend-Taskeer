@@ -15,6 +15,11 @@ export const remindersRouter = Router();
 // contra WorkspaceMember (a través de la cadena Task → Column → Board →
 // Workspace) antes de cada acción.
 
+// Nivel raíz bajo /me, no bajo /tasks — cruza todos los workspaces del
+// usuario para el dashboard de Inicio, a diferencia del resto de rutas de
+// este módulo que siempre parten de una tarea puntual.
+remindersRouter.get('/me/reminders/upcoming', requireAuth, remindersController.listUpcoming);
+
 remindersRouter.post(
   '/tasks/:taskId/reminders',
   requireAuth,

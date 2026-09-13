@@ -52,6 +52,16 @@ export const updateBoardSchema = z.object({
     }),
 });
 
+// null = ilimitado (ver Column.wipLimit en schema.prisma) — 0 no tendría
+// sentido operativo (una columna que nunca admite tareas), así que se exige
+// al menos 1 cuando sí se manda un número.
+const wipLimitField = z
+  .number()
+  .int('El límite debe ser un entero.')
+  .min(1, 'El límite debe ser mayor a 0.')
+  .nullable()
+  .optional();
+
 export const createColumnSchema = z.object({
   params: z.object({ workspaceId: uuidParam, boardId: uuidParam }),
   body: z.object({
@@ -60,6 +70,7 @@ export const createColumnSchema = z.object({
       .trim()
       .min(1, 'El nombre de la columna es obligatorio.')
       .max(100, 'El nombre de la columna es demasiado largo.'),
+    wipLimit: wipLimitField,
   }),
 });
 
@@ -82,10 +93,30 @@ export const updateColumnSchema = z.object({
         .int('La posición debe ser un entero.')
         .min(0, 'La posición no puede ser negativa.')
         .optional(),
+      wipLimit: wipLimitField,
     })
-    .refine((data) => data.name !== undefined || data.position !== undefined, {
-      message: 'Debes enviar al menos un campo para actualizar (name o position).',
-    }),
+    .refine(
+      (data) => data.name !== undefined || data.position !== undefined || data.wipLimit !== undefined,
+      { message: 'Debes enviar al menos un campo para actualizar (name, position o wipLimit).' },
+    ),
+});
+
+// --- Overrides de rol por board (roles por tablero individual) ---
+// Solo lo gestiona el OWNER/ADMIN del workspace — ver
+// boards.service.ts::requireOwnerOrAdmin, que para estas acciones usa
+// siempre el rol crudo de WorkspaceMember, nunca el rol efectivo.
+
+const workspaceRole = z.enum(['OWNER', 'ADMIN', 'EDITOR', 'VIEWER']);
+
+export const setBoardMemberOverrideSchema = z.object({
+  params: z.object({ workspaceId: uuidParam, boardId: uuidParam, userId: uuidParam }),
+  body: z.object({
+    role: workspaceRole,
+  }),
+});
+
+export const boardMemberOverrideParamsSchema = z.object({
+  params: z.object({ workspaceId: uuidParam, boardId: uuidParam, userId: uuidParam }),
 });
 
 export type WorkspaceIdParams = z.infer<typeof workspaceIdParamSchema>['params'];
@@ -95,3 +126,5 @@ export type UpdateBoardInput = z.infer<typeof updateBoardSchema>['body'];
 export type CreateColumnInput = z.infer<typeof createColumnSchema>['body'];
 export type ColumnParams = z.infer<typeof columnParamsSchema>['params'];
 export type UpdateColumnInput = z.infer<typeof updateColumnSchema>['body'];
+export type SetBoardMemberOverrideInput = z.infer<typeof setBoardMemberOverrideSchema>['body'];
+export type BoardMemberOverrideParams = z.infer<typeof boardMemberOverrideParamsSchema>['params'];

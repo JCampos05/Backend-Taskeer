@@ -1,9 +1,17 @@
-import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
+import type { TaskPriority as PrismaTaskPriority, WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
+import { boardsService } from '../boards/boards.service';
 import { pushNotification } from '../notifications/notifications.stream';
-import type { CreateTaskInput, MoveTaskInput, UpdateTaskInput } from './tasks.schema';
-import type { TaskDto } from './tasks.types';
+import type {
+  CreateSubtaskInput,
+  CreateTaskInput,
+  ListTasksQuery,
+  MoveTaskInput,
+  UpdateSubtaskInput,
+  UpdateTaskInput,
+} from './tasks.schema';
+import type { SubtaskDto, TaskDto } from './tasks.types';
 
 // EDITOR sí puede crear/mover/editar/borrar Task dentro de columnas ya
 // existentes (a diferencia de boards/columnas, exclusivas de OWNER/ADMIN) —
@@ -17,6 +25,7 @@ function toTaskDto(task: {
   title: string;
   description: string | null;
   dueAt: Date | null;
+  priority: PrismaTaskPriority;
   position: number;
   createdAt: Date;
   updatedAt: Date;
@@ -28,6 +37,7 @@ function toTaskDto(task: {
     title: task.title,
     description: task.description,
     dueAt: task.dueAt ? task.dueAt.toISOString() : null,
+    priority: task.priority,
     position: task.position,
     createdAt: task.createdAt.toISOString(),
     updatedAt: task.updatedAt.toISOString(),
@@ -40,14 +50,23 @@ function getMembership(workspaceId: string, userId: string): Promise<WorkspaceMe
   });
 }
 
-function requireMutationRole(membership: WorkspaceMember) {
-  if (!MUTATION_ROLES.includes(membership.role)) {
+function requireMutationRole(role: WorkspaceRole) {
+  if (!MUTATION_ROLES.includes(role)) {
     throw new AppError(
       403,
       'FORBIDDEN',
       'No tienes permisos suficientes para modificar tareas en este workspace.',
     );
   }
+}
+
+/** Resuelve el rol EFECTIVO de `membership` en el board `boardId` — delega
+ * a boards.service.ts (ver ese comentario para el detalle de por qué esto
+ * se importa entre módulos en vez de duplicarse: es lógica de permisos,
+ * un drift entre dos copias sería un bug de seguridad). Task hereda el
+ * override de su Board dueño — no tiene uno propio. */
+function resolveEffectiveRole(boardId: string, membership: WorkspaceMember): Promise<WorkspaceRole> {
+  return boardsService.resolveEffectiveRole(boardId, membership);
 }
 
 /** Resuelve una columna (y su board/workspace) no borrados a partir de su id.
@@ -90,6 +109,30 @@ async function requireTaskAccess(taskId: string, userId: string) {
   }
 
   return { task, column: task.column, board: task.column.board, workspaceId, membership };
+}
+
+/** Rechaza con 409 si agregar una tarea más a `columnId` superaría su
+ * `wipLimit` (null = ilimitado, no valida nada). Cuenta solo tareas no
+ * borradas — mismo criterio que el resto de conteos/reordenamiento de
+ * position en este módulo.
+ *
+ * Nota de concurrencia, mismo criterio ya aceptado para el reordenamiento
+ * de `position` (ver Historial en PROGRESS.md, 2026-08-26): dos requests
+ * casi simultáneas contra la misma columna casi llena podrían pasar ambas
+ * este chequeo antes de que cualquiera cree/mueva su tarea, dejando la
+ * columna un poco por encima del límite en el peor caso — tolerable al
+ * volumen esperado del MVP, no se agrega locking pesimista por esto. */
+async function assertWipLimitNotReached(columnId: string, wipLimit: number | null): Promise<void> {
+  if (wipLimit === null) return;
+
+  const count = await prisma.task.count({ where: { columnId, deletedAt: null } });
+  if (count >= wipLimit) {
+    throw new AppError(
+      409,
+      'COLUMN_WIP_LIMIT_REACHED',
+      `Esta columna ya tiene ${wipLimit} tareas, su límite configurado.`,
+    );
+  }
 }
 
 /** Si `assigneeId` viene, verifica que esa persona sea miembro del mismo
@@ -139,9 +182,10 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<TaskD
   if (!membership) {
     throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
   }
-  requireMutationRole(membership);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
 
   await assertAssigneeIsMember(board.workspaceId, input.assigneeId);
+  await assertWipLimitNotReached(column.id, column.wipLimit);
 
   // Decisión: la siguiente posición se calcula sobre tareas no borradas —
   // las soft-deleted no ocupan un lugar visible en la columna, así que no
@@ -159,6 +203,7 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<TaskD
       title: input.title,
       description: input.description ?? null,
       dueAt: input.dueAt ? new Date(input.dueAt) : null,
+      priority: input.priority ?? 'MEDIUM',
       position: nextPosition,
     },
   });
@@ -170,7 +215,11 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<TaskD
   return toTaskDto(task);
 }
 
-async function listTasksByBoard(boardId: string, userId: string): Promise<TaskDto[]> {
+async function listTasksByBoard(
+  boardId: string,
+  userId: string,
+  priority?: ListTasksQuery['priority'],
+): Promise<TaskDto[]> {
   const board = await prisma.board.findFirst({ where: { id: boardId, deletedAt: null } });
   if (!board) {
     throw new AppError(404, 'BOARD_NOT_FOUND', 'El board no existe.');
@@ -182,7 +231,7 @@ async function listTasksByBoard(boardId: string, userId: string): Promise<TaskDt
   }
 
   const tasks = await prisma.task.findMany({
-    where: { deletedAt: null, column: { boardId } },
+    where: { deletedAt: null, column: { boardId }, ...(priority ? { priority } : {}) },
     orderBy: [{ column: { position: 'asc' } }, { position: 'asc' }],
   });
 
@@ -195,8 +244,8 @@ async function getTaskById(taskId: string, userId: string): Promise<TaskDto> {
 }
 
 async function updateTask(taskId: string, userId: string, input: UpdateTaskInput): Promise<TaskDto> {
-  const { task, workspaceId, membership } = await requireTaskAccess(taskId, userId);
-  requireMutationRole(membership);
+  const { task, board, workspaceId, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
 
   if (input.assigneeId !== undefined) {
     await assertAssigneeIsMember(workspaceId, input.assigneeId);
@@ -209,6 +258,7 @@ async function updateTask(taskId: string, userId: string, input: UpdateTaskInput
       ...(input.description !== undefined ? { description: input.description } : {}),
       ...(input.dueAt !== undefined ? { dueAt: input.dueAt ? new Date(input.dueAt) : null } : {}),
       ...(input.assigneeId !== undefined ? { assigneeId: input.assigneeId } : {}),
+      ...(input.priority !== undefined ? { priority: input.priority } : {}),
     },
   });
 
@@ -230,7 +280,7 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
     taskId,
     userId,
   );
-  requireMutationRole(membership);
+  requireMutationRole(await resolveEffectiveRole(sourceBoard.id, membership));
 
   const { column: destinationColumn, board: destinationBoard } = await requireColumnContext(
     input.columnId,
@@ -257,7 +307,22 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
     );
   }
 
+  // El board destino puede ser distinto del origen (mismo workspace, otro
+  // board) y tener su propio override — sin este chequeo, alguien sin
+  // permiso de mutar tareas en el board destino (ej. VIEWER por override
+  // ahí) podría "colar" una tarea vía un board origen donde sí es EDITOR.
+  if (destinationBoard.id !== sourceBoard.id) {
+    requireMutationRole(await resolveEffectiveRole(destinationBoard.id, destinationMembership));
+  }
+
   const isSameColumn = sourceColumn.id === destinationColumn.id;
+
+  // Solo aplica al entrar a una columna DISTINTA — reordenar dentro de la
+  // misma columna no cambia cuántas tareas tiene, así que nunca puede violar
+  // su propio límite.
+  if (!isSameColumn) {
+    await assertWipLimitNotReached(destinationColumn.id, destinationColumn.wipLimit);
+  }
 
   const updatedTask = await prisma.$transaction(async (tx) => {
     if (isSameColumn) {
@@ -316,8 +381,8 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
 }
 
 async function deleteTask(taskId: string, userId: string): Promise<void> {
-  const { task, membership } = await requireTaskAccess(taskId, userId);
-  requireMutationRole(membership);
+  const { task, board, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
 
   // Soft delete — nunca DELETE directo (docs/02-modelo-datos.md). No es un
   // evento de seguridad en el sentido de CLAUDE.md (login, cambio de rol,
@@ -329,6 +394,166 @@ async function deleteTask(taskId: string, userId: string): Promise<void> {
   });
 }
 
+function toSubtaskDto(subtask: {
+  id: string;
+  taskId: string;
+  assigneeId: string | null;
+  title: string;
+  dueAt: Date | null;
+  completed: boolean;
+  position: number;
+  createdAt: Date;
+  updatedAt: Date;
+}): SubtaskDto {
+  return {
+    id: subtask.id,
+    taskId: subtask.taskId,
+    assigneeId: subtask.assigneeId,
+    title: subtask.title,
+    dueAt: subtask.dueAt ? subtask.dueAt.toISOString() : null,
+    completed: subtask.completed,
+    position: subtask.position,
+    createdAt: subtask.createdAt.toISOString(),
+    updatedAt: subtask.updatedAt.toISOString(),
+  };
+}
+
+/** Resuelve un subtask no borrado que pertenezca a `taskId` — 404 uniforme
+ * si no existe o pertenece a otra tarea (nunca revela que un subtask ajeno
+ * sí existe con un ID válido). Asume que quien llama ya corrió
+ * requireTaskAccess sobre esa misma taskId. */
+async function requireSubtask(taskId: string, subtaskId: string) {
+  const notFoundError = new AppError(404, 'SUBTASK_NOT_FOUND', 'El paso no existe.');
+
+  const subtask = await prisma.subtask.findUnique({ where: { id: subtaskId } });
+  if (!subtask || subtask.taskId !== taskId) {
+    throw notFoundError;
+  }
+
+  return subtask;
+}
+
+async function listSubtasks(taskId: string, userId: string): Promise<SubtaskDto[]> {
+  await requireTaskAccess(taskId, userId);
+
+  const subtasks = await prisma.subtask.findMany({
+    where: { taskId },
+    orderBy: { position: 'asc' },
+  });
+
+  return subtasks.map(toSubtaskDto);
+}
+
+async function createSubtask(
+  taskId: string,
+  userId: string,
+  input: CreateSubtaskInput,
+): Promise<SubtaskDto> {
+  const { board, workspaceId, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
+
+  await assertAssigneeIsMember(workspaceId, input.assigneeId);
+
+  const highestPosition = await prisma.subtask.aggregate({
+    where: { taskId },
+    _max: { position: true },
+  });
+  const nextPosition = (highestPosition._max.position ?? -1) + 1;
+
+  const subtask = await prisma.subtask.create({
+    data: {
+      taskId,
+      assigneeId: input.assigneeId ?? null,
+      title: input.title,
+      dueAt: input.dueAt ? new Date(input.dueAt) : null,
+      position: nextPosition,
+    },
+  });
+
+  return toSubtaskDto(subtask);
+}
+
+async function updateSubtask(
+  taskId: string,
+  subtaskId: string,
+  userId: string,
+  input: UpdateSubtaskInput,
+): Promise<SubtaskDto> {
+  const { board, workspaceId, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
+  const subtask = await requireSubtask(taskId, subtaskId);
+
+  if (input.assigneeId !== undefined) {
+    await assertAssigneeIsMember(workspaceId, input.assigneeId);
+  }
+
+  // Marcar completado nunca se valida contra en qué columna está la Task
+  // dueña — el checklist de una tarea es independiente de si esa tarea ya
+  // se movió a "Terminado" o no (confirmado explícitamente por el usuario:
+  // no debe bloquear ni exigir nada sobre el estado de la Task).
+  if (input.position === undefined) {
+    const updated = await prisma.subtask.update({
+      where: { id: subtask.id },
+      data: {
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.dueAt !== undefined ? { dueAt: input.dueAt ? new Date(input.dueAt) : null } : {}),
+        ...(input.assigneeId !== undefined ? { assigneeId: input.assigneeId } : {}),
+        ...(input.completed !== undefined ? { completed: input.completed } : {}),
+      },
+    });
+    return toSubtaskDto(updated);
+  }
+
+  // Reordenamiento — mismo patrón que updateColumn en boards.service.ts:
+  // reacomoda el position de los demás subtasks de la misma tarea.
+  const updatedSubtask = await prisma.$transaction(async (tx) => {
+    const siblings = await tx.subtask.findMany({
+      where: { taskId },
+      orderBy: { position: 'asc' },
+    });
+
+    const withoutMoved = siblings.filter((sibling) => sibling.id !== subtaskId);
+    const clampedPosition = Math.max(0, Math.min(input.position!, withoutMoved.length));
+    withoutMoved.splice(clampedPosition, 0, subtask);
+
+    await Promise.all(
+      withoutMoved.map((sibling, index) =>
+        tx.subtask.update({
+          where: { id: sibling.id },
+          data: {
+            position: index,
+            ...(sibling.id === subtaskId
+              ? {
+                  ...(input.title !== undefined ? { title: input.title } : {}),
+                  ...(input.dueAt !== undefined
+                    ? { dueAt: input.dueAt ? new Date(input.dueAt) : null }
+                    : {}),
+                  ...(input.assigneeId !== undefined ? { assigneeId: input.assigneeId } : {}),
+                  ...(input.completed !== undefined ? { completed: input.completed } : {}),
+                }
+              : {}),
+          },
+        }),
+      ),
+    );
+
+    return tx.subtask.findUniqueOrThrow({ where: { id: subtaskId } });
+  });
+
+  return toSubtaskDto(updatedSubtask);
+}
+
+async function deleteSubtask(taskId: string, subtaskId: string, userId: string): Promise<void> {
+  const { board, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(await resolveEffectiveRole(board.id, membership));
+  const subtask = await requireSubtask(taskId, subtaskId);
+
+  // Hard delete — a diferencia de Task, Subtask no tiene deletedAt propio
+  // (mismo criterio que Column, ver schema.prisma): es un hijo desechable,
+  // se borra tal cual.
+  await prisma.subtask.delete({ where: { id: subtask.id } });
+}
+
 export const tasksService = {
   createTask,
   listTasksByBoard,
@@ -336,4 +561,8 @@ export const tasksService = {
   updateTask,
   moveTask,
   deleteTask,
+  listSubtasks,
+  createSubtask,
+  updateSubtask,
+  deleteSubtask,
 };

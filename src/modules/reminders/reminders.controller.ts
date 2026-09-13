@@ -40,8 +40,18 @@ async function cancel(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+async function listUpcoming(req: Request, res: Response, next: NextFunction) {
+  try {
+    const reminders = await remindersService.listUpcomingForUser(req.auth!.sub);
+    res.status(200).json({ reminders });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export const remindersController = {
   create,
   list,
   cancel,
+  listUpcoming,
 };

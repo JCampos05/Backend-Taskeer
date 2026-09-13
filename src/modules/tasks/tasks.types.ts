@@ -2,6 +2,8 @@
 // el Frontend por ahora — cada uno define los suyos (ver
 // docs/01-arquitectura.md).
 
+export type TaskPriority = 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT';
+
 export interface TaskDto {
   id: string;
   columnId: string;
@@ -12,6 +14,19 @@ export interface TaskDto {
   // responsabilidad del frontend (UserPreferences.timezoneId), nunca del
   // backend (ver CLAUDE.md, reglas no negociables).
   dueAt: string | null;
+  priority: TaskPriority;
+  position: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SubtaskDto {
+  id: string;
+  taskId: string;
+  assigneeId: string | null;
+  title: string;
+  dueAt: string | null;
+  completed: boolean;
   position: number;
   createdAt: string;
   updatedAt: string;

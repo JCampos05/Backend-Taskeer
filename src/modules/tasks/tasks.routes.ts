@@ -3,10 +3,13 @@ import { requireAuth } from '../../middlewares/requireAuth';
 import { validate } from '../../middlewares/validate';
 import { tasksController } from './tasks.controller';
 import {
+  createSubtaskSchema,
   createTaskSchema,
   listTasksSchema,
   moveTaskSchema,
+  subtaskParamsSchema,
   taskIdParamSchema,
+  updateSubtaskSchema,
   updateTaskSchema,
 } from './tasks.schema';
 
@@ -52,4 +55,34 @@ tasksRouter.delete(
   requireAuth,
   validate(taskIdParamSchema),
   tasksController.remove,
+);
+
+// --- Subtasks (checklist dentro de una tarea) ---
+
+tasksRouter.get(
+  '/tasks/:taskId/subtasks',
+  requireAuth,
+  validate(taskIdParamSchema),
+  tasksController.listSubtasks,
+);
+
+tasksRouter.post(
+  '/tasks/:taskId/subtasks',
+  requireAuth,
+  validate(createSubtaskSchema),
+  tasksController.createSubtask,
+);
+
+tasksRouter.patch(
+  '/tasks/:taskId/subtasks/:subtaskId',
+  requireAuth,
+  validate(updateSubtaskSchema),
+  tasksController.updateSubtask,
+);
+
+tasksRouter.delete(
+  '/tasks/:taskId/subtasks/:subtaskId',
+  requireAuth,
+  validate(subtaskParamsSchema),
+  tasksController.removeSubtask,
 );

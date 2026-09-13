@@ -4,6 +4,8 @@ import { requireAuth } from '../../middlewares/requireAuth';
 import { validate } from '../../middlewares/validate';
 import { authController } from './auth.controller';
 import {
+  changePasswordSchema,
+  googleLoginSchema,
   loginSchema,
   regenerateRecoveryCodesSchema,
   registerSchema,
@@ -62,6 +64,22 @@ authRouter.post(
 // Con solo 10 códigos fijos por cuenta, sin esto alguien podría intentar
 // adivinar la contraseña por fuerza bruta (ver docs/03-autenticacion-seguridad.md).
 authRouter.post('/auth/login', crearRateLimitAuth(10), validate(loginSchema), authController.login);
+// El Frontend solo navega acá (un <a>/window.location, no fetch) — arma la
+// URL de autorización de Google con las credenciales de Supabase que solo
+// vive el Backend y hace el redirect 302. Rate limit generoso: es
+// user-initiated (un click), no hay contraseña ni token de por medio que
+// proteger, mismo criterio que resend-verification.
+authRouter.get('/auth/google/redirect', crearRateLimitAuth(30), authController.googleRedirect);
+// La contraseña ya no es el factor de riesgo acá (la identidad la garantiza
+// la firma del JWT de Supabase, verificada en el service) — el límite es más
+// generoso que login, mismo criterio que resend-verification: el riesgo real
+// es abuso del endpoint, no fuerza bruta contra un secreto.
+authRouter.post(
+  '/auth/google',
+  crearRateLimitAuth(20),
+  validate(googleLoginSchema),
+  authController.googleLogin,
+);
 // Mucho más generoso que login: a diferencia de ese, este NO es
 // user-initiated — se dispara solo en cada carga/recarga de la app
 // (bootstrap()) y cada vez que el access token vence (~15min), así que un
@@ -88,6 +106,18 @@ authRouter.post(
   crearRateLimitAuth(10),
   validate(regenerateRecoveryCodesSchema),
   authController.regenerateRecoveryCodes,
+);
+// Igual de agresivo que login/reset-password-with-code — exige la
+// contraseña actual, pero sin este límite alguien con un access token
+// robado podría forzar repetidos argon2.verify dentro de la ventana de vida
+// del token (~15min), mismo riesgo ya documentado en
+// recovery-codes/regenerate.
+authRouter.post(
+  '/auth/change-password',
+  requireAuth,
+  crearRateLimitAuth(10),
+  validate(changePasswordSchema),
+  authController.changePassword,
 );
 // Perfil del usuario autenticado — vive acá porque toca User directamente,
 // la misma entidad que ya maneja este módulo (no amerita un módulo aparte

@@ -1,12 +1,15 @@
 import { randomBytes, randomInt, createHash } from 'node:crypto';
 import argon2 from 'argon2';
 import jwt from 'jsonwebtoken';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { prisma } from '../../config/prisma';
 import { env } from '../../config/env';
 import { AppError } from '../../errors/AppError';
 import { mailService } from '../../services/mail/mail.service';
 import { pushNotification } from '../notifications/notifications.stream';
 import type {
+  ChangePasswordInput,
+  GoogleLoginInput,
   LoginInput,
   RegenerateRecoveryCodesInput,
   RegisterInput,
@@ -15,6 +18,7 @@ import type {
   VerifyEmailInput,
 } from './auth.schema';
 import type {
+  GoogleLoginServiceResult,
   JwtAccessTokenPayload,
   LoginServiceResult,
   PublicUserDto,
@@ -22,6 +26,7 @@ import type {
   RefreshServiceResult,
   RegisterResultDto,
   ResendVerificationResultDto,
+  SupabaseAccessTokenPayload,
 } from './auth.types';
 
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -36,12 +41,14 @@ function toPublicUser(user: {
   email: string;
   displayName: string;
   emailVerifiedAt: Date | null;
+  passwordHash: string | null;
 }): PublicUserDto {
   return {
     id: user.id,
     email: user.email,
     displayName: user.displayName,
     emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
+    hasPassword: user.passwordHash !== null,
   };
 }
 
@@ -254,7 +261,13 @@ async function verifyEmail(input: VerifyEmailInput): Promise<void> {
  * registra `auditAction` en AuditLog dentro de la misma transacción. Usado
  * tanto por login (sesión nueva) como por refresh (rotación de sesión). */
 async function issueSession(
-  user: { id: string; email: string; displayName: string; emailVerifiedAt: Date | null },
+  user: {
+    id: string;
+    email: string;
+    displayName: string;
+    emailVerifiedAt: Date | null;
+    passwordHash: string | null;
+  },
   context: { userAgent?: string; ipAddress?: string },
   auditAction: string,
 ): Promise<LoginServiceResult> {
@@ -306,12 +319,14 @@ async function login(
     'Correo o contraseña incorrectos.',
   );
 
-  // Si el usuario no existe, igual se verifica contra un hash señuelo — así
-  // el costo de CPU (y por lo tanto el tiempo de respuesta) es equivalente
-  // al de un intento con email existente, y no se puede enumerar cuentas
-  // registradas por timing.
+  // Si el usuario no existe, o existe pero solo tiene una cuenta de Google
+  // vinculada (passwordHash null — nunca inició sesión local), se verifica
+  // igual contra un hash señuelo en vez de comparar contra un hash vacío:
+  // mismo costo de CPU en los tres casos, así que ninguno se puede distinguir
+  // del resto por timing (docs/03-autenticacion-seguridad.md, "Inicio de
+  // sesión con Google").
   const passwordMatches = await argon2.verify(
-    user ? user.passwordHash : await getDummyHash(),
+    user?.passwordHash ?? (await getDummyHash()),
     input.password,
   );
 
@@ -329,6 +344,308 @@ async function login(
   }
 
   return issueSession(user, context, 'auth.login');
+}
+
+/** Arma la URL de autorización de Google de Supabase y la devuelve para que
+ * el controller haga un redirect 302 del navegador — el Frontend nunca
+ * necesita las credenciales de Supabase ni la librería @supabase/supabase-js,
+ * solo navega a `GET /auth/google/redirect`. Sin `code_challenge` (PKCE),
+ * GoTrue responde con el flujo implícito: el access token vuelve directo en
+ * el fragmento de la URL de `redirect_to` (`#access_token=...`), no como un
+ * código a intercambiar — ver "Inicio de sesión con Google" en
+ * docs/03-autenticacion-seguridad.md para el detalle completo y el tradeoff
+ * aceptado. */
+function buildGoogleAuthorizeUrl(state: string): string {
+  // El nonce anti-CSRF viaja como query param DENTRO de `redirect_to`, no
+  // como un `state` de nivel superior hacia Supabase — Supabase preserva la
+  // query string de `redirect_to` tal cual y solo le agrega el fragmento
+  // (`#access_token=...`) al volver, así que esto sobrevive el viaje
+  // completo sin depender de que Supabase reenvíe un `state` propio de
+  // forma documentada para este flujo específico.
+  const redirectTo = `${env.publicWebUrl}/auth/callback?state=${encodeURIComponent(state)}`;
+  const params = new URLSearchParams({
+    provider: 'google',
+    redirect_to: redirectTo,
+    // Kong (el gateway delante de GoTrue) exige la key en cada request a
+    // /auth/v1/*, incluida esta — como es un redirect de navegador y no un
+    // fetch, la única forma de mandarla es en la query string. No es un
+    // secreto (ver docs/03-autenticacion-seguridad.md): queda visible en la
+    // URL de todos modos durante la navegación, esté donde esté construida.
+    apikey: env.supabaseAnonKey,
+  });
+  return `${env.supabaseUrl}/auth/v1/authorize?${params.toString()}`;
+}
+
+// Claves públicas vigentes del proyecto de Supabase (Auth > JWT Signing
+// Keys) — `createRemoteJWKSet` las cachea en memoria y las refresca sola
+// cuando aparece un `kid` que no conoce, así que sobrevive una rotación de
+// clave sin reiniciar el servidor. Creado una sola vez a nivel de módulo,
+// no en cada request.
+const supabaseJwks = createRemoteJWKSet(new URL(`${env.supabaseUrl}/auth/v1/.well-known/jwks.json`));
+
+/** Verifica la firma del JWT que Supabase Auth le entrega al frontend tras
+ * el login con Google — nunca se confía en el `sub`/`email` que el cliente
+ * diga tener sin validar esto primero (docs/03-autenticacion-seguridad.md,
+ * "Inicio de sesión con Google"). `audience: 'authenticated'` es el valor
+ * fijo que Supabase pone en todo JWT de sesión de un usuario autenticado.
+ *
+ * Se verifica contra el JWKS de Supabase (clave pública), no contra un
+ * secreto compartido: el proyecto rotó su signing key de HS256 legacy a una
+ * ECC (P-256) sin avisar (comportamiento normal de Supabase, no un
+ * incidente), así que un secreto fijo en `.env` queda obsoleto ante
+ * cualquier rotación futura — el JWKS siempre resuelve la clave vigente.
+ * `algorithms` se restringe explícitamente a los dos algoritmos asimétricos
+ * que Supabase usa para signing keys, nunca a HS256 — aceptar HS256 acá
+ * abriría una vía de forjar tokens usando la clave pública como si fuera un
+ * secreto compartido (confusión de algoritmo). */
+async function verifySupabaseAccessToken(token: string): Promise<SupabaseAccessTokenPayload> {
+  try {
+    const { payload } = await jwtVerify(token, supabaseJwks, {
+      algorithms: ['ES256', 'RS256'],
+      audience: 'authenticated',
+      issuer: `${env.supabaseUrl}/auth/v1`,
+    });
+    return payload as unknown as SupabaseAccessTokenPayload;
+  } catch {
+    throw new AppError(401, 'INVALID_GOOGLE_TOKEN', 'La sesión de Google no es válida o venció.');
+  }
+}
+
+// Forma mínima de la respuesta de GET /auth/v1/user que a Taskeer le
+// importa — solo el array `identities`, nunca cacheado.
+interface SupabaseUserResponse {
+  identities?: Array<{ provider?: string; identity_data?: { email_verified?: boolean } }>;
+}
+
+/** Resuelve si Google reportó el correo como verificado, leyendo
+ * `identities[].identity_data.email_verified` desde la propia API de
+ * Supabase (GoTrue) en vez de confiar en `user_metadata` del JWT.
+ * `user_metadata` es editable por el usuario autenticado (ej. llamando a
+ * `PUT /auth/v1/user` con su propio access token + la anon key, que ya es
+ * pública) — un atacante podría escribir `user_metadata.email_verified =
+ * true` sin que Google haya verificado nada. `identity_data`, en cambio, es
+ * un espejo de lo que el proveedor OAuth entregó en el último login y no se
+ * actualiza a través de `updateUser`, así que es la fuente confiable para
+ * esta decisión de seguridad. */
+async function fetchGoogleEmailVerified(supabaseAccessToken: string): Promise<boolean> {
+  let response: Response;
+  try {
+    response = await fetch(`${env.supabaseUrl}/auth/v1/user`, {
+      headers: {
+        Authorization: `Bearer ${supabaseAccessToken}`,
+        apikey: env.supabaseAnonKey,
+      },
+    });
+  } catch {
+    throw new AppError(401, 'INVALID_GOOGLE_TOKEN', 'La sesión de Google no es válida o venció.');
+  }
+
+  if (!response.ok) {
+    throw new AppError(401, 'INVALID_GOOGLE_TOKEN', 'La sesión de Google no es válida o venció.');
+  }
+
+  const data = (await response.json()) as SupabaseUserResponse;
+  const googleIdentity = data.identities?.find((identity) => identity.provider === 'google');
+  return Boolean(googleIdentity?.identity_data?.email_verified);
+}
+
+/** Login/registro con Google vía Supabase Auth. Supabase nunca es la fuente
+ * de verdad de un usuario de Taskeer — solo resuelve el intercambio OAuth
+ * con Google; quien decide si la persona "existe" sigue siendo `User` en
+ * MySQL. Ver "Inicio de sesión con Google" en docs/03-autenticacion-seguridad.md
+ * para la política completa de vinculación de cuentas. */
+// P2002 = violación de constraint @unique de Prisma. Dos requests
+// concurrentes con el mismo `sub` de Google (doble clic, reintento de red)
+// pueden chocar contra el @@unique de OAuthIdentity o el @unique de
+// User.email — se trata como "alguien más ya lo resolvió", no como error.
+function isUniqueConstraintViolation(err: unknown): boolean {
+  return Boolean(
+    err && typeof err === 'object' && 'code' in err && (err as { code?: string }).code === 'P2002',
+  );
+}
+
+async function loginWithGoogle(
+  input: GoogleLoginInput,
+  context: { userAgent?: string; ipAddress?: string },
+): Promise<GoogleLoginServiceResult> {
+  const payload = await verifySupabaseAccessToken(input.supabaseAccessToken);
+
+  if (payload.app_metadata?.provider !== 'google') {
+    throw new AppError(400, 'INVALID_PROVIDER', 'Este endpoint solo acepta sesiones de Google.');
+  }
+
+  // Defensivo: en la práctica Google/Supabase siempre incluyen el correo,
+  // pero un JWT malformado o un scope distinto no debe tumbar la request con
+  // un TypeError sin control.
+  if (!payload.email) {
+    throw new AppError(
+      400,
+      'GOOGLE_EMAIL_MISSING',
+      'La cuenta de Google no compartió un correo electrónico.',
+    );
+  }
+
+  const existingIdentity = await prisma.oAuthIdentity.findUnique({
+    where: { provider_providerUserId: { provider: 'GOOGLE', providerUserId: payload.sub } },
+    include: { user: true },
+  });
+
+  if (existingIdentity) {
+    return issueSession(existingIdentity.user, context, 'auth.google_login');
+  }
+
+  // El axioma "Google ya verificó el correo" (docs/03-autenticacion-seguridad.md)
+  // solo vale si viene confirmado por una fuente que el usuario no pueda
+  // escribir — no todo login de Google trae el correo verificado (cuentas
+  // corporativas, otros flujos). Se resuelve contra `identities` de la API
+  // de Supabase, no contra `user_metadata` del JWT (ver
+  // fetchGoogleEmailVerified): sin esto, se podría vincular o crear una
+  // cuenta a partir de un correo que Google no garantiza que sea del usuario
+  // real, o directamente falsificado por el propio cliente.
+  const googleEmailVerified = await fetchGoogleEmailVerified(input.supabaseAccessToken);
+  if (!googleEmailVerified) {
+    throw new AppError(
+      403,
+      'GOOGLE_EMAIL_NOT_VERIFIED',
+      'Tu cuenta de Google no tiene el correo verificado.',
+    );
+  }
+
+  const email = payload.email.toLowerCase();
+  const existingUser = await prisma.user.findUnique({ where: { email } });
+
+  if (existingUser) {
+    // Vulnerabilidad cerrada acá: si la cuenta LOCAL con este correo nunca
+    // verificó ser su dueña (emailVerifiedAt null), NO se auto-vincula. Sin
+    // este chequeo, un atacante podría registrarse localmente primero con el
+    // correo de la víctima (registro no exige verificar el correo para
+    // poder usarse) y, cuando la víctima real inicie sesión con Google, el
+    // backend vincularía la identidad de Google de la víctima a la cuenta
+    // del atacante — la víctima terminaría con una sesión de una cuenta cuya
+    // contraseña conoce el atacante. Que Google haya verificado el correo no
+    // dice nada sobre si ESTA cuenta local ya demostró ser su dueña.
+    if (!existingUser.emailVerifiedAt) {
+      throw new AppError(
+        409,
+        'LOCAL_ACCOUNT_EMAIL_NOT_VERIFIED',
+        'Ya existe una cuenta con este correo sin verificar. Verifica tu correo o inicia sesión con tu contraseña antes de vincular Google.',
+      );
+    }
+
+    // Vinculación automática, sin paso de confirmación extra: con el correo
+    // ya verificado en ambos lados (Google y la cuenta local), Google es una
+    // fuente de verificación tan confiable como la que Taskeer usaría por su
+    // cuenta (decisión ya documentada, no una relajación de seguridad nueva).
+    try {
+      await prisma.$transaction([
+        prisma.oAuthIdentity.create({
+          data: { userId: existingUser.id, provider: 'GOOGLE', providerUserId: payload.sub },
+        }),
+        prisma.auditLog.create({
+          data: {
+            userId: existingUser.id,
+            action: 'auth.google_account_linked',
+            ipAddress: context.ipAddress,
+          },
+        }),
+      ]);
+    } catch (err) {
+      if (!isUniqueConstraintViolation(err)) {
+        throw err;
+      }
+      // Alguien más (misma identidad de Google, request concurrente) ya
+      // ganó la carrera — se resuelve como login normal a continuación.
+    }
+
+    return issueSession(existingUser, context, 'auth.google_login');
+  }
+
+  const freePlan = await prisma.plan.findUnique({ where: { code: 'FREE' } });
+  if (!freePlan) {
+    // No debería pasar si el seed corrió correctamente — ver prisma/seed.ts.
+    throw new AppError(
+      500,
+      'FREE_PLAN_NOT_SEEDED',
+      'No se pudo completar el registro. Intenta más tarde.',
+    );
+  }
+
+  const displayName =
+    payload.user_metadata?.full_name?.trim() ||
+    payload.user_metadata?.name?.trim() ||
+    email.split('@')[0];
+
+  // Igual que register(): estos son la única vía de recuperación real que
+  // tiene una cuenta de Google (no tiene contraseña local, así que "olvidé
+  // mi contraseña" no aplica) — se generan al completar el registro, no
+  // antes ni como paso opcional (docs/03-autenticacion-seguridad.md).
+  const recoveryCodes = generateRecoveryCodeSet();
+  let isNewSignup = true;
+
+  let newUser;
+  try {
+    newUser = await prisma.$transaction(async (tx) => {
+      // Google ya verificó el correo (chequeado arriba) — no hace falta el
+      // flujo de AuthToken/EMAIL_VERIFICATION para estas cuentas.
+      const createdUser = await tx.user.create({
+        data: {
+          email,
+          passwordHash: null,
+          displayName,
+          emailVerifiedAt: new Date(),
+        },
+      });
+
+      await tx.oAuthIdentity.create({
+        data: { userId: createdUser.id, provider: 'GOOGLE', providerUserId: payload.sub },
+      });
+
+      await tx.subscription.create({
+        data: { userId: createdUser.id, planId: freePlan.id },
+      });
+
+      await tx.recoveryCode.createMany({
+        data: recoveryCodes.map((rc) => ({ userId: createdUser.id, codeHash: rc.hash })),
+      });
+
+      await tx.auditLog.create({
+        data: {
+          userId: createdUser.id,
+          action: 'auth.google_signup',
+          ipAddress: context.ipAddress,
+        },
+      });
+
+      return createdUser;
+    });
+  } catch (err) {
+    if (!isUniqueConstraintViolation(err)) {
+      throw err;
+    }
+    // Carrera: otra request concurrente con el mismo `sub` ya creó la
+    // identidad (o alguien se registró con este correo justo en el medio).
+    // Se resuelve buscando de nuevo en vez de fallar con un 500 genérico —
+    // esos códigos de recuperación ya los generó la request que ganó la
+    // carrera, no hay que devolver un segundo set.
+    const identity = await prisma.oAuthIdentity.findUnique({
+      where: { provider_providerUserId: { provider: 'GOOGLE', providerUserId: payload.sub } },
+      include: { user: true },
+    });
+    if (!identity) {
+      throw err;
+    }
+    newUser = identity.user;
+    isNewSignup = false;
+  }
+
+  const session = await issueSession(newUser, context, 'auth.google_login');
+
+  // Se muestran una sola vez, aquí, justo después del registro — igual que
+  // en register(). Ni el usuario ni el backend pueden volver a verlos
+  // después (solo se persiste el hash de cada uno).
+  return isNewSignup
+    ? { ...session, recoveryCodes: recoveryCodes.map((rc) => rc.plain) }
+    : session;
 }
 
 async function refreshAccessToken(
@@ -483,6 +800,18 @@ async function regenerateRecoveryCodes(
     throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
   }
 
+  // Cuenta que solo entra por Google (docs/03-autenticacion-seguridad.md,
+  // "Inicio de sesión con Google") — no hay contraseña local contra la cual
+  // confirmar. Regenerar exige sesión activa + contraseña, nunca "en frío";
+  // sin una contraseña que verificar, no hay forma segura de continuar.
+  if (!user.passwordHash) {
+    throw new AppError(
+      400,
+      'NO_LOCAL_PASSWORD',
+      'Tu cuenta no tiene contraseña local todavía. Agrega una desde tu perfil antes de regenerar códigos de recuperación.',
+    );
+  }
+
   const passwordMatches = await argon2.verify(user.passwordHash, input.currentPassword);
   if (!passwordMatches) {
     throw new AppError(401, 'INVALID_CREDENTIALS', 'Contraseña incorrecta.');
@@ -505,6 +834,76 @@ async function regenerateRecoveryCodes(
   ]);
 
   return { recoveryCodes: recoveryCodes.map((rc) => rc.plain) };
+}
+
+async function changePassword(
+  userId: string,
+  input: ChangePasswordInput,
+  context: { userAgent?: string; ipAddress?: string },
+): Promise<LoginServiceResult> {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
+  }
+
+  // Mismo criterio que regenerateRecoveryCodes: sin contraseña local no hay
+  // nada contra qué confirmar la actual (cuenta que solo entra por Google).
+  if (!user.passwordHash) {
+    throw new AppError(
+      400,
+      'NO_LOCAL_PASSWORD',
+      'Tu cuenta no tiene contraseña local todavía — inició sesión con Google.',
+    );
+  }
+
+  const passwordMatches = await argon2.verify(user.passwordHash, input.currentPassword);
+  if (!passwordMatches) {
+    throw new AppError(401, 'INVALID_CREDENTIALS', 'La contraseña actual no es correcta.');
+  }
+
+  const newPasswordHash = await argon2.hash(input.newPassword, { type: argon2.argon2id });
+
+  await prisma.$transaction(async (tx) => {
+    // updateMany condicionado por el passwordHash ya verificado arriba (en
+    // vez de un update por id incondicional) — mismo patrón atómico que
+    // resetPasswordWithCode/refreshAccessToken: si dos cambios de contraseña
+    // concurrentes del mismo usuario llegan casi al mismo tiempo, el que
+    // pierde la carrera ve `count === 0` (el passwordHash ya no coincide con
+    // el que verificó) y aborta con un error explícito, en vez de pisar en
+    // silencio la contraseña que la otra request acaba de establecer.
+    const { count } = await tx.user.updateMany({
+      where: { id: user.id, passwordHash: user.passwordHash },
+      data: { passwordHash: newPasswordHash },
+    });
+
+    if (count === 0) {
+      throw new AppError(
+        409,
+        'CONCURRENT_PASSWORD_CHANGE',
+        'Tu contraseña ya se actualizó desde otra sesión. Vuelve a intentarlo.',
+      );
+    }
+
+    // Regla no negociable: cambiar la contraseña revoca todas las sesiones
+    // activas (docs/03-autenticacion-seguridad.md) — incluida la que hizo
+    // esta misma request; issueSession() de abajo le emite una sesión nueva
+    // para no forzar un relogin inmediato de quien la acaba de cambiar a
+    // propósito, mientras cualquier otro dispositivo sí queda deslogueado.
+    await tx.refreshToken.updateMany({
+      where: { userId: user.id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    await tx.auditLog.create({
+      data: { userId: user.id, action: 'auth.password_changed', ipAddress: context.ipAddress },
+    });
+  });
+
+  return issueSession(
+    { ...user, passwordHash: newPasswordHash },
+    context,
+    'auth.password_changed_session_reissued',
+  );
 }
 
 async function logout(refreshTokenPlain: string | undefined): Promise<void> {
@@ -541,12 +940,15 @@ async function updateProfile(userId: string, input: UpdateProfileInput): Promise
 
 export const authService = {
   register,
+  buildGoogleAuthorizeUrl,
   resendVerificationEmail,
   verifyEmail,
   login,
+  loginWithGoogle,
   refreshAccessToken,
   resetPasswordWithCode,
   regenerateRecoveryCodes,
+  changePassword,
   updateProfile,
   logout,
 };

@@ -2,9 +2,11 @@ import type { Request, Response, NextFunction } from 'express';
 import { boardsService } from './boards.service';
 import type {
   BoardIdParams,
+  BoardMemberOverrideParams,
   ColumnParams,
   CreateBoardInput,
   CreateColumnInput,
+  SetBoardMemberOverrideInput,
   UpdateBoardInput,
   UpdateColumnInput,
   WorkspaceIdParams,
@@ -103,6 +105,47 @@ async function removeColumn(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+async function listMemberOverrides(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { workspaceId, boardId } = req.params as unknown as BoardIdParams;
+    const overrides = await boardsService.listBoardMemberOverrides(
+      workspaceId,
+      boardId,
+      req.auth!.sub,
+    );
+    res.status(200).json({ overrides });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function setMemberOverride(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { workspaceId, boardId, userId } = req.params as unknown as BoardMemberOverrideParams;
+    const input = req.body as SetBoardMemberOverrideInput;
+    const override = await boardsService.setBoardMemberOverride(
+      workspaceId,
+      boardId,
+      userId,
+      req.auth!.sub,
+      input,
+    );
+    res.status(200).json({ override });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function removeMemberOverride(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { workspaceId, boardId, userId } = req.params as unknown as BoardMemberOverrideParams;
+    await boardsService.removeBoardMemberOverride(workspaceId, boardId, userId, req.auth!.sub);
+    res.status(200).json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export const boardsController = {
   create,
   list,
@@ -112,4 +155,7 @@ export const boardsController = {
   createColumn,
   updateColumn,
   removeColumn,
+  listMemberOverrides,
+  setMemberOverride,
+  removeMemberOverride,
 };

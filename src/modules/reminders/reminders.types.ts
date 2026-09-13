@@ -13,3 +13,15 @@ export interface ReminderDto {
   sentAt: string | null;
   createdAt: string;
 }
+
+// Para el dashboard de Inicio — a diferencia de ReminderDto (recordatorios
+// de UNA tarea puntual), esto cruza todos los workspaces del usuario, así
+// que trae ya resuelto el contexto (tarea/tablero/workspace) que el
+// Frontend necesita para armar el link directo sin pedir nada más.
+export interface UpcomingReminderDto {
+  id: string;
+  remindAt: string;
+  task: { id: string; title: string };
+  board: { id: string; name: string };
+  workspaceId: string;
+}

@@ -1,10 +1,13 @@
 import type { Request, Response, NextFunction } from 'express';
 import { tasksService } from './tasks.service';
 import type {
+  CreateSubtaskInput,
   CreateTaskInput,
   ListTasksQuery,
   MoveTaskInput,
+  SubtaskParams,
   TaskIdParams,
+  UpdateSubtaskInput,
   UpdateTaskInput,
 } from './tasks.schema';
 
@@ -23,8 +26,8 @@ async function create(req: Request, res: Response, next: NextFunction) {
 
 async function list(req: Request, res: Response, next: NextFunction) {
   try {
-    const { boardId } = req.query as unknown as ListTasksQuery;
-    const tasks = await tasksService.listTasksByBoard(boardId, req.auth!.sub);
+    const { boardId, priority } = req.query as unknown as ListTasksQuery;
+    const tasks = await tasksService.listTasksByBoard(boardId, req.auth!.sub, priority);
     res.status(200).json({ tasks });
   } catch (err) {
     next(err);
@@ -73,6 +76,48 @@ async function remove(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+async function listSubtasks(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId } = req.params as unknown as TaskIdParams;
+    const subtasks = await tasksService.listSubtasks(taskId, req.auth!.sub);
+    res.status(200).json({ subtasks });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createSubtask(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId } = req.params as unknown as TaskIdParams;
+    const input = req.body as CreateSubtaskInput;
+    const subtask = await tasksService.createSubtask(taskId, req.auth!.sub, input);
+    res.status(201).json({ subtask });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateSubtask(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId, subtaskId } = req.params as unknown as SubtaskParams;
+    const input = req.body as UpdateSubtaskInput;
+    const subtask = await tasksService.updateSubtask(taskId, subtaskId, req.auth!.sub, input);
+    res.status(200).json({ subtask });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function removeSubtask(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId, subtaskId } = req.params as unknown as SubtaskParams;
+    await tasksService.deleteSubtask(taskId, subtaskId, req.auth!.sub);
+    res.status(200).json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export const tasksController = {
   create,
   list,
@@ -80,4 +125,8 @@ export const tasksController = {
   update,
   move,
   remove,
+  listSubtasks,
+  createSubtask,
+  updateSubtask,
+  removeSubtask,
 };

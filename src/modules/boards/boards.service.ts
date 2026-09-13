@@ -2,8 +2,14 @@ import { randomBytes } from 'node:crypto';
 import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
-import type { CreateBoardInput, CreateColumnInput, UpdateBoardInput, UpdateColumnInput } from './boards.schema';
-import type { BoardDetailDto, BoardDto, ColumnDto } from './boards.types';
+import type {
+  CreateBoardInput,
+  CreateColumnInput,
+  SetBoardMemberOverrideInput,
+  UpdateBoardInput,
+  UpdateColumnInput,
+} from './boards.schema';
+import type { BoardDetailDto, BoardDto, BoardMemberOverrideDto, ColumnDto } from './boards.types';
 
 // Roles con permiso para crear/renombrar/borrar boards y columnas — ver
 // docs/02-modelo-datos.md, sección WorkspaceMember. EDITOR puede tocar Task
@@ -38,6 +44,7 @@ function toColumnDto(column: {
   boardId: string;
   name: string;
   position: number;
+  wipLimit: number | null;
   createdAt: Date;
   updatedAt: Date;
 }): ColumnDto {
@@ -46,6 +53,7 @@ function toColumnDto(column: {
     boardId: column.boardId,
     name: column.name,
     position: column.position,
+    wipLimit: column.wipLimit,
     createdAt: column.createdAt.toISOString(),
     updatedAt: column.updatedAt.toISOString(),
   };
@@ -119,14 +127,56 @@ async function requireMembership(workspaceId: string, userId: string) {
   return { workspace, membership };
 }
 
-function requireOwnerOrAdmin(membership: WorkspaceMember) {
-  if (!OWNER_LIKE_ROLES.includes(membership.role)) {
+function requireOwnerOrAdmin(role: WorkspaceRole) {
+  if (!OWNER_LIKE_ROLES.includes(role)) {
     throw new AppError(
       403,
       'FORBIDDEN',
-      'Solo el propietario o un administrador del workspace pueden gestionar boards y columnas.',
+      'Solo el propietario o un administrador pueden gestionar boards y columnas.',
     );
   }
+}
+
+/** Resuelve el rol EFECTIVO de un usuario en un board puntual — el rol de
+ * `BoardMemberOverride` si existe uno para ese board, si no el rol crudo de
+ * `WorkspaceMember`. Reemplaza (no combina) en ambas direcciones: puede
+ * subir o bajar el rol respecto al de workspace (confirmado con el
+ * usuario), y de facto habilita gestionar columnas/board en ese board
+ * puntual si el override es a OWNER/ADMIN, aunque el rol de workspace sea
+ * menor.
+ *
+ * NUNCA usar esto para decidir quién puede gestionar los overrides en sí —
+ * ver setBoardMemberOverride/removeBoardMemberOverride/
+ * listBoardMemberOverrides, que siempre usan `membership.role` crudo. Si se
+ * usara acá, alguien con un override a OWNER en un board podría gestionar
+ * overrides de otros usuarios en ese mismo board, escalando más allá de lo
+ * que el verdadero OWNER/ADMIN del workspace autorizó. */
+async function resolveEffectiveRole(
+  boardId: string,
+  membership: WorkspaceMember,
+): Promise<WorkspaceRole> {
+  const override = await prisma.boardMemberOverride.findUnique({
+    where: { boardId_userId: { boardId, userId: membership.userId } },
+  });
+  return override?.role ?? membership.role;
+}
+
+function toBoardMemberOverrideDto(override: {
+  id: string;
+  boardId: string;
+  userId: string;
+  role: WorkspaceRole;
+  createdAt: Date;
+  updatedAt: Date;
+}): BoardMemberOverrideDto {
+  return {
+    id: override.id,
+    boardId: override.boardId,
+    userId: override.userId,
+    role: override.role,
+    createdAt: override.createdAt.toISOString(),
+    updatedAt: override.updatedAt.toISOString(),
+  };
 }
 
 /** Resuelve un board no borrado dentro del workspace dado, o 404 uniforme —
@@ -149,7 +199,10 @@ async function createBoard(
   input: CreateBoardInput,
 ): Promise<BoardDto> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
+  // Sin resolveEffectiveRole acá — el board todavía no existe, no puede
+  // haber un override sobre él. Crear boards siempre depende del rol de
+  // workspace crudo.
+  requireOwnerOrAdmin(membership.role);
 
   const slug = await generateUniqueSlug(workspaceId, input.name);
 
@@ -190,8 +243,14 @@ async function getBoardById(
   boardId: string,
   userId: string,
 ): Promise<BoardDetailDto> {
-  await requireMembership(workspaceId, userId);
+  const { membership } = await requireMembership(workspaceId, userId);
   const board = await requireBoard(workspaceId, boardId);
+  // El rol EFECTIVO de quien pide el detalle — el Frontend lo necesita para
+  // saber qué botones mostrar en ESTE board puntual, que puede diferir del
+  // rol de workspace si hay un BoardMemberOverride (ver resolveEffectiveRole
+  // arriba). Nunca se expone el rol efectivo de OTRO usuario acá — cada
+  // quien solo ve el suyo propio, resuelto contra su propia membership.
+  const viewerEffectiveRole = await resolveEffectiveRole(board.id, membership);
 
   const columns = await prisma.column.findMany({
     where: { boardId: board.id },
@@ -200,12 +259,19 @@ async function getBoardById(
       tasks: {
         where: { deletedAt: null },
         orderBy: { position: 'asc' },
+        include: {
+          // Solo se necesita el booleano para contar hechos/total — traer
+          // los subtasks completos de cada tarea del board de una vez es
+          // barato (son listas chicas) y evita una request por tarjeta.
+          subtasks: { select: { completed: true } },
+        },
       },
     },
   });
 
   return {
     ...toBoardDto(board),
+    viewerEffectiveRole,
     columns: columns.map((column) => ({
       ...toColumnDto(column),
       tasks: column.tasks.map((task) => ({
@@ -214,8 +280,11 @@ async function getBoardById(
         title: task.title,
         description: task.description,
         dueAt: task.dueAt ? task.dueAt.toISOString() : null,
+        priority: task.priority,
         position: task.position,
         assigneeId: task.assigneeId,
+        subtaskTotal: task.subtasks.length,
+        subtaskCompletado: task.subtasks.filter((s) => s.completed).length,
       })),
     })),
   };
@@ -228,8 +297,8 @@ async function updateBoard(
   input: UpdateBoardInput,
 ): Promise<BoardDto> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
   await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
   if (input.slug !== undefined) {
     const existing = await prisma.board.findUnique({
@@ -253,8 +322,8 @@ async function updateBoard(
 
 async function deleteBoard(workspaceId: string, boardId: string, userId: string): Promise<void> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
   await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
   await prisma.$transaction([
     // Soft delete — nunca DELETE directo (docs/02-modelo-datos.md).
@@ -280,8 +349,8 @@ async function createColumn(
   input: CreateColumnInput,
 ): Promise<ColumnDto> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
   await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
   const highestPosition = await prisma.column.aggregate({
     where: { boardId },
@@ -290,7 +359,7 @@ async function createColumn(
   const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
   const column = await prisma.column.create({
-    data: { boardId, name: input.name, position: nextPosition },
+    data: { boardId, name: input.name, position: nextPosition, wipLimit: input.wipLimit ?? null },
   });
 
   return toColumnDto(column);
@@ -304,8 +373,8 @@ async function updateColumn(
   input: UpdateColumnInput,
 ): Promise<ColumnDto> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
   await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
   const column = await prisma.column.findFirst({ where: { id: columnId, boardId } });
   if (!column) {
@@ -315,7 +384,7 @@ async function updateColumn(
   if (input.position === undefined) {
     const updated = await prisma.column.update({
       where: { id: columnId },
-      data: { name: input.name },
+      data: { name: input.name, wipLimit: input.wipLimit },
     });
     return toColumnDto(updated);
   }
@@ -341,7 +410,11 @@ async function updateColumn(
     ),
     prisma.column.update({
       where: { id: columnId },
-      data: { name: input.name ?? column.name, position: clampedPosition },
+      data: {
+        name: input.name ?? column.name,
+        position: clampedPosition,
+        wipLimit: input.wipLimit !== undefined ? input.wipLimit : column.wipLimit,
+      },
     }),
   ]);
 
@@ -356,8 +429,8 @@ async function deleteColumn(
   userId: string,
 ): Promise<void> {
   const { membership } = await requireMembership(workspaceId, userId);
-  requireOwnerOrAdmin(membership);
   await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
   const column = await prisma.column.findFirst({ where: { id: columnId, boardId } });
   if (!column) {
@@ -384,6 +457,95 @@ async function deleteColumn(
   await prisma.column.delete({ where: { id: columnId } });
 }
 
+// --- Roles por tablero individual (overrides) ---
+// Gestionado SIEMPRE con el rol crudo de WorkspaceMember (membership.role),
+// nunca con resolveEffectiveRole — ver el comentario de esa función arriba.
+
+async function listBoardMemberOverrides(
+  workspaceId: string,
+  boardId: string,
+  userId: string,
+): Promise<BoardMemberOverrideDto[]> {
+  const { membership } = await requireMembership(workspaceId, userId);
+  await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(membership.role);
+
+  const overrides = await prisma.boardMemberOverride.findMany({ where: { boardId } });
+  return overrides.map(toBoardMemberOverrideDto);
+}
+
+async function setBoardMemberOverride(
+  workspaceId: string,
+  boardId: string,
+  targetUserId: string,
+  userId: string,
+  input: SetBoardMemberOverrideInput,
+): Promise<BoardMemberOverrideDto> {
+  const { membership } = await requireMembership(workspaceId, userId);
+  await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(membership.role);
+
+  // El destinatario del override debe ser miembro del mismo workspace — no
+  // tiene sentido darle un rol efectivo en un board a alguien ajeno.
+  const targetMembership = await getMembership(workspaceId, targetUserId);
+  if (!targetMembership) {
+    throw new AppError(
+      422,
+      'USER_NOT_WORKSPACE_MEMBER',
+      'Esa persona debe ser miembro de este workspace.',
+    );
+  }
+
+  const [override] = await prisma.$transaction([
+    prisma.boardMemberOverride.upsert({
+      where: { boardId_userId: { boardId, userId: targetUserId } },
+      create: { boardId, userId: targetUserId, role: input.role },
+      update: { role: input.role },
+    }),
+    // Evento de seguridad explícito en CLAUDE.md ("cambio de rol") — se
+    // audita igual que deleteBoard/board.deleted arriba. Este override
+    // puede llegar a dar de facto un rol OWNER/ADMIN sobre el board, así
+    // que dejar rastro de quién se lo dio a quién es tan importante como
+    // auditar un cambio de rol de workspace.
+    prisma.auditLog.create({
+      data: {
+        userId,
+        action: 'board_member_override.set',
+        metadata: { workspaceId, boardId, targetUserId, role: input.role },
+      },
+    }),
+  ]);
+
+  return toBoardMemberOverrideDto(override);
+}
+
+async function removeBoardMemberOverride(
+  workspaceId: string,
+  boardId: string,
+  targetUserId: string,
+  userId: string,
+): Promise<void> {
+  const { membership } = await requireMembership(workspaceId, userId);
+  await requireBoard(workspaceId, boardId);
+  requireOwnerOrAdmin(membership.role);
+
+  // deleteMany (no delete) — quitar un override que ya no existe es un
+  // no-op válido, no un error: el estado final deseado ("sin override para
+  // este usuario en este board") ya se cumple. Se audita de todos modos,
+  // incluso si no había nada que borrar — mismo criterio de "cambio de
+  // rol" que setBoardMemberOverride arriba.
+  await prisma.$transaction([
+    prisma.boardMemberOverride.deleteMany({ where: { boardId, userId: targetUserId } }),
+    prisma.auditLog.create({
+      data: {
+        userId,
+        action: 'board_member_override.removed',
+        metadata: { workspaceId, boardId, targetUserId },
+      },
+    }),
+  ]);
+}
+
 export const boardsService = {
   createBoard,
   listBoards,
@@ -393,4 +555,14 @@ export const boardsService = {
   createColumn,
   updateColumn,
   deleteColumn,
+  listBoardMemberOverrides,
+  setBoardMemberOverride,
+  removeBoardMemberOverride,
+  // Usado desde modules/tasks/tasks.service.ts para que la creación/edición/
+  // movimiento de tareas también respete el rol efectivo por board, no solo
+  // el de workspace — primer import entre módulos de dominio en el Backend,
+  // deliberado: la lógica de permisos no se duplica (a diferencia de
+  // slugify, que sí se duplica a propósito) porque un drift entre dos
+  // copias de esta regla sería un bug de seguridad, no solo de estilo.
+  resolveEffectiveRole,
 };

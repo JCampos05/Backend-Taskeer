@@ -6,6 +6,11 @@ export interface PublicUserDto {
   email: string;
   displayName: string;
   emailVerifiedAt: string | null;
+  // false para cuentas creadas por Google que nunca agregaron una
+  // contraseña local (User.passwordHash null) — el Frontend lo usa para
+  // decidir si mostrar "cambiar contraseña"/"regenerar códigos de
+  // recuperación" o una nota explicando por qué esa cuenta no aplica.
+  hasPassword: boolean;
 }
 
 export interface RegisterResultDto {
@@ -53,3 +58,28 @@ export interface JwtAccessTokenPayload {
 // token (revoca el usado, entrega uno nuevo) además de emitir un access
 // token nuevo — reduce la ventana de reuso si un refresh token se filtra.
 export type RefreshServiceResult = LoginServiceResult;
+
+// Subconjunto de claims del JWT que Supabase Auth firma tras un login con
+// Google — solo lo que Taskeer necesita leer, no el shape completo real de
+// Supabase. `sub` es el identificador estable de la identidad en Supabase
+// (OAuthIdentity.providerUserId), no el id de User de Taskeer.
+export interface SupabaseAccessTokenPayload {
+  sub: string;
+  email: string;
+  app_metadata?: { provider?: string };
+  // Deliberadamente SIN `email_verified` acá: viene dentro de este objeto en
+  // el JWT real de Supabase GoTrue, pero `user_metadata` es editable por el
+  // propio usuario autenticado (ver fetchGoogleEmailVerified en
+  // auth.service.ts) — nunca se lee de aquí para decisiones de seguridad.
+  user_metadata?: { full_name?: string; name?: string };
+}
+
+// Mismo shape que LoginServiceResult, más los códigos de recuperación —
+// SOLO presentes cuando este login creó una cuenta nueva (equivalente a
+// RegisterResultDto.recoveryCodes). En login de una identidad ya existente o
+// vinculación a una cuenta local, el campo no viene: esos usuarios ya
+// recibieron sus códigos en su momento (registro local, o un login con
+// Google anterior).
+export interface GoogleLoginServiceResult extends LoginServiceResult {
+  recoveryCodes?: string[];
+}

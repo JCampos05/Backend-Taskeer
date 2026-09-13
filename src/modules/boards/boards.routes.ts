@@ -4,9 +4,11 @@ import { validate } from '../../middlewares/validate';
 import { boardsController } from './boards.controller';
 import {
   boardIdParamsSchema,
+  boardMemberOverrideParamsSchema,
   columnParamsSchema,
   createBoardSchema,
   createColumnSchema,
+  setBoardMemberOverrideSchema,
   updateBoardSchema,
   updateColumnSchema,
   workspaceIdParamSchema,
@@ -73,4 +75,27 @@ boardsRouter.delete(
   requireAuth,
   validate(columnParamsSchema),
   boardsController.removeColumn,
+);
+
+// --- Roles por tablero individual (overrides) ---
+
+boardsRouter.get(
+  '/workspaces/:workspaceId/boards/:boardId/member-overrides',
+  requireAuth,
+  validate(boardIdParamsSchema),
+  boardsController.listMemberOverrides,
+);
+
+boardsRouter.put(
+  '/workspaces/:workspaceId/boards/:boardId/member-overrides/:userId',
+  requireAuth,
+  validate(setBoardMemberOverrideSchema),
+  boardsController.setMemberOverride,
+);
+
+boardsRouter.delete(
+  '/workspaces/:workspaceId/boards/:boardId/member-overrides/:userId',
+  requireAuth,
+  validate(boardMemberOverrideParamsSchema),
+  boardsController.removeMemberOverride,
 );
