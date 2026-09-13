@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { requireAuth } from '../../middlewares/requireAuth';
+import { requireTrustedOrigin } from '../../middlewares/requireTrustedOrigin';
 import { validate } from '../../middlewares/validate';
 import { authController } from './auth.controller';
 import {
@@ -87,7 +88,15 @@ authRouter.post(
 // exige un refresh token válido (cookie httpOnly) para hacer algo, así que
 // el riesgo que este límite cubre es otro: frenar el replay rápido de un
 // refresh token robado, no fuerza bruta de credenciales.
-authRouter.post('/auth/refresh', crearRateLimitAuth(60), authController.refresh);
+// `requireTrustedOrigin`: con la cookie en `sameSite: 'none'`, esta ruta no
+// exige ningún body validado — sin este chequeo de `Origin`, CSRF real (ver
+// docs/03-autenticacion-seguridad.md, sección de cookies cross-site).
+authRouter.post(
+  '/auth/refresh',
+  requireTrustedOrigin,
+  crearRateLimitAuth(60),
+  authController.refresh,
+);
 // Igual de agresivo que login — incluso más crítico: solo 10 códigos fijos
 // por cuenta para adivinar (ver docs/03-autenticacion-seguridad.md).
 authRouter.post(
@@ -129,4 +138,4 @@ authRouter.patch(
   authController.updateProfile,
 );
 
-authRouter.post('/auth/logout', authController.logout);
+authRouter.post('/auth/logout', requireTrustedOrigin, authController.logout);
