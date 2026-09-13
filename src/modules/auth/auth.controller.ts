@@ -17,10 +17,17 @@ import type {
 // El controller nunca llama a Prisma directamente ni contiene lógica de
 // negocio — solo adapta req/res y delega todo a auth.service.
 
+// `sameSite: 'none'` (requiere `secure: true`, ya presente): Frontend y
+// Backend viven en dominios distintos en producción (Vercel/Render), así
+// que toda llamada del Frontend (`withCredentials: true`, XHR, nunca
+// navegación de nivel superior) es cross-site desde la perspectiva del
+// navegador — `strict`/`lax` nunca viajarían en esa llamada. Antes de este
+// cambio esto pasaba desapercibido solo porque Frontend y Backend se
+// probaban ambos en `localhost` (mismo sitio pese al puerto distinto).
 const REFRESH_TOKEN_COOKIE_OPTIONS = {
   httpOnly: true,
   secure: true,
-  sameSite: 'strict' as const,
+  sameSite: 'none' as const,
   path: '/api/v1/auth',
 };
 
@@ -28,16 +35,14 @@ const REFRESH_TOKEN_COOKIE_OPTIONS = {
 // swapping: sin esto, un atacante podría completar su propio flujo de
 // Google, capturar la URL con SU access_token, y engañar a la víctima para
 // que la abra — el navegador de la víctima terminaría autenticado como el
-// atacante sin notarlo). `sameSite: 'lax'` a propósito, a diferencia del
-// refresh token (`strict`): esta cookie tiene que sobrevivir la navegación
-// de nivel superior de VUELTA desde Supabase/Google, que sí cuenta como
-// "cross-site" en el momento exacto en que el navegador aterriza de nuevo
-// en este dominio.
+// atacante sin notarlo). Mismo motivo que la cookie de refresh arriba:
+// `sameSite: 'none'` porque el `POST /auth/google` que la valida es una
+// llamada cross-site del Frontend, no una navegación de nivel superior.
 const OAUTH_STATE_COOKIE_NAME = 'taskeer_oauth_state';
 const OAUTH_STATE_COOKIE_OPTIONS = {
   httpOnly: true,
   secure: true,
-  sameSite: 'lax' as const,
+  sameSite: 'none' as const,
   path: '/api/v1/auth',
   maxAge: 10 * 60 * 1000, // 10 minutos — tiempo generoso para completar el login en Google
 };

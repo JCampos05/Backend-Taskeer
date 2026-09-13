@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import { buildDatabaseUrl } from '../src/config/database-url';
 import { countries, timezones } from './seed-data';
