@@ -7,6 +7,7 @@ import { env } from './config/env';
 import { errorHandler } from './middlewares/errorHandler';
 import { authRouter } from './modules/auth/auth.routes';
 import { boardsRouter } from './modules/boards/boards.routes';
+import { myDayRouter } from './modules/my-day/my-day.routes';
 import { notificationsRouter } from './modules/notifications/notifications.routes';
 import { preferencesRouter } from './modules/preferences/preferences.routes';
 import { remindersRouter } from './modules/reminders/reminders.routes';
@@ -61,6 +62,7 @@ apiRouter.use(tasksRouter);
 apiRouter.use(remindersRouter);
 apiRouter.use(notificationsRouter);
 apiRouter.use(preferencesRouter);
+apiRouter.use(myDayRouter);
 // Un módulo nuevo de dominio nunca debe quedar huérfano sin montar aquí.
 
 app.use('/api/v1', apiRouter);

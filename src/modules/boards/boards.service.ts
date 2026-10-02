@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
+import { pushNotification } from '../notifications/notifications.stream';
 import type {
   CreateBoardInput,
   CreateColumnInput,
@@ -458,8 +459,23 @@ async function deleteColumn(
 }
 
 // --- Roles por tablero individual (overrides) ---
-// Gestionado SIEMPRE con el rol crudo de WorkspaceMember (membership.role),
-// nunca con resolveEffectiveRole — ver el comentario de esa función arriba.
+
+/** Más estricto que un simple requireOwnerOrAdmin(membership.role): exige
+ * que quien gestiona overrides sea OWNER/ADMIN tanto en su rol de
+ * workspace CRUDO (para que nadie escale vía un override propio, ver
+ * resolveEffectiveRole) COMO en su rol EFECTIVO en este board puntual.
+ * Ese segundo chequeo es lo que evita que un ADMIN real de workspace, a
+ * quien OTRO admin restringió en este board puntual (override a
+ * EDITOR/VIEWER), pueda usar su rol de workspace para revertir esa
+ * restricción él mismo — confirmado con el usuario: si no tiene permiso
+ * de ver/gestionar roles en ESTE board, no debe ver el panel siquiera. */
+async function requireCanManageBoardOverrides(
+  boardId: string,
+  membership: WorkspaceMember,
+): Promise<void> {
+  requireOwnerOrAdmin(membership.role);
+  requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
+}
 
 async function listBoardMemberOverrides(
   workspaceId: string,
@@ -468,7 +484,7 @@ async function listBoardMemberOverrides(
 ): Promise<BoardMemberOverrideDto[]> {
   const { membership } = await requireMembership(workspaceId, userId);
   await requireBoard(workspaceId, boardId);
-  requireOwnerOrAdmin(membership.role);
+  await requireCanManageBoardOverrides(boardId, membership);
 
   const overrides = await prisma.boardMemberOverride.findMany({ where: { boardId } });
   return overrides.map(toBoardMemberOverrideDto);
@@ -482,8 +498,8 @@ async function setBoardMemberOverride(
   input: SetBoardMemberOverrideInput,
 ): Promise<BoardMemberOverrideDto> {
   const { membership } = await requireMembership(workspaceId, userId);
-  await requireBoard(workspaceId, boardId);
-  requireOwnerOrAdmin(membership.role);
+  const board = await requireBoard(workspaceId, boardId);
+  await requireCanManageBoardOverrides(boardId, membership);
 
   // El destinatario del override debe ser miembro del mismo workspace — no
   // tiene sentido darle un rol efectivo en un board a alguien ajeno.
@@ -516,6 +532,24 @@ async function setBoardMemberOverride(
     }),
   ]);
 
+  // Notifica a la persona afectada — mismo motivo que en
+  // workspaces.service.ts::updateMemberRole: sin esto, su rol efectivo en
+  // este board cambiaba sin que se enterara si ya tenía el tablero abierto
+  // (bug reportado por el usuario probando esta feature: dos pestañas
+  // mostraban roles inconsistentes entre sí porque una de las dos nunca se
+  // enteraba del cambio). Fuera de la transacción — best-effort.
+  if (targetUserId !== userId) {
+    const notification = await prisma.notification.create({
+      data: {
+        userId: targetUserId,
+        type: 'ROLE_CHANGED',
+        title: 'Tu rol en un tablero cambió',
+        body: `Ahora sos ${input.role} en el tablero "${board.name}".`,
+      },
+    });
+    pushNotification(notification);
+  }
+
   return toBoardMemberOverrideDto(override);
 }
 
@@ -526,8 +560,8 @@ async function removeBoardMemberOverride(
   userId: string,
 ): Promise<void> {
   const { membership } = await requireMembership(workspaceId, userId);
-  await requireBoard(workspaceId, boardId);
-  requireOwnerOrAdmin(membership.role);
+  const board = await requireBoard(workspaceId, boardId);
+  await requireCanManageBoardOverrides(boardId, membership);
 
   // deleteMany (no delete) — quitar un override que ya no existe es un
   // no-op válido, no un error: el estado final deseado ("sin override para
@@ -544,6 +578,21 @@ async function removeBoardMemberOverride(
       },
     }),
   ]);
+
+  // Mismo motivo que en setBoardMemberOverride — notifica a la persona
+  // afectada para que su pestaña abierta (si tiene una) se entere del
+  // cambio en vez de quedar con un rol efectivo desactualizado.
+  if (targetUserId !== userId) {
+    const notification = await prisma.notification.create({
+      data: {
+        userId: targetUserId,
+        type: 'ROLE_CHANGED',
+        title: 'Tu rol en un tablero cambió',
+        body: `Tu rol especial en el tablero "${board.name}" se quitó — volvés a tu rol de workspace ahí.`,
+      },
+    });
+    pushNotification(notification);
+  }
 }
 
 export const boardsService = {

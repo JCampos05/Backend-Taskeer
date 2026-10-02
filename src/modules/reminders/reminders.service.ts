@@ -174,7 +174,10 @@ async function listUpcomingForUser(userId: string): Promise<UpcomingReminderDto[
         column: {
           board: {
             deletedAt: null,
-            workspace: { members: { some: { userId } } },
+            // workspace.deletedAt también, no solo board.deletedAt — un
+            // workspace borrado no cascadea a sus Board (ver mismo hallazgo
+            // corregido en tasks.service.ts::requireTaskAccess/listTasksByBoard).
+            workspace: { deletedAt: null, members: { some: { userId } } },
           },
         },
       },

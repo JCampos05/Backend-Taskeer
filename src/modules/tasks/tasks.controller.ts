@@ -118,6 +118,26 @@ async function removeSubtask(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+async function addToMyDay(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId } = req.params as unknown as TaskIdParams;
+    await tasksService.addTaskToMyDay(taskId, req.auth!.sub);
+    res.status(200).json({ added: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function removeFromMyDay(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { taskId } = req.params as unknown as TaskIdParams;
+    await tasksService.removeTaskFromMyDay(taskId, req.auth!.sub);
+    res.status(200).json({ removed: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export const tasksController = {
   create,
   list,
@@ -129,4 +149,6 @@ export const tasksController = {
   createSubtask,
   updateSubtask,
   removeSubtask,
+  addToMyDay,
+  removeFromMyDay,
 };

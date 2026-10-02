@@ -135,6 +135,7 @@ model User {
   subscription      Subscription?
   oauthIdentities   OAuthIdentity[]
   attachments       Attachment[]
+  myDayTasks        MyDayTask[]
 
   @@map("users")
 }
@@ -459,11 +460,37 @@ model Task {
   notifications Notification[]
   attachments   Attachment[]
   subtasks      Subtask[]
+  myDayFlags    MyDayTask[]
 
   @@index([columnId, position])
   @@index([assigneeId])
   @@index([dueAt])
   @@map("tasks")
+}
+
+// Marca personal, puesta por el propio dueño de la cuenta (no por otro
+// miembro del workspace), de "quiero ver/trabajar esta tarea en Mi día".
+// Independiente de si la tarea está asignada a este usuario o no — solo
+// requiere que tenga acceso a ella (se valida en el service, igual que
+// cualquier otra lectura de Task). Deliberadamente sin su propio "leído":
+// a diferencia de Notification (evento puntual), esto es un estado
+// on/off que el usuario prende y apaga él mismo — quitarla de Mi día es
+// borrar la fila, no marcarla.
+model MyDayTask {
+  id      String   @id @default(uuid()) @db.Char(36)
+  userId  String   @db.Char(36)
+  taskId  String   @db.Char(36)
+  addedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Un mismo usuario no puede marcar la misma tarea dos veces — el endpoint
+  // de "agregar a mi día" es un upsert sobre esta combinación. Este unique ya
+  // cubre "todas las MyDayTask de este usuario" como prefijo izquierdo, sin
+  // falta un índice aparte por userId.
+  @@unique([userId, taskId])
+  @@map("my_day_tasks")
 }
 
 // Paso/checklist dentro de una Task — se puede marcar completado

@@ -86,3 +86,19 @@ tasksRouter.delete(
   validate(subtaskParamsSchema),
   tasksController.removeSubtask,
 );
+
+// --- "Mi día" (marca personal, ver tasks.service.ts) ---
+
+tasksRouter.put(
+  '/tasks/:taskId/my-day',
+  requireAuth,
+  validate(taskIdParamSchema),
+  tasksController.addToMyDay,
+);
+
+tasksRouter.delete(
+  '/tasks/:taskId/my-day',
+  requireAuth,
+  validate(taskIdParamSchema),
+  tasksController.removeFromMyDay,
+);

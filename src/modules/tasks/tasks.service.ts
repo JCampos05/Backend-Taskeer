@@ -11,7 +11,7 @@ import type {
   UpdateSubtaskInput,
   UpdateTaskInput,
 } from './tasks.schema';
-import type { SubtaskDto, TaskDto } from './tasks.types';
+import type { MyDayTaskDto, SubtaskDto, TaskDto } from './tasks.types';
 
 // EDITOR sí puede crear/mover/editar/borrar Task dentro de columnas ya
 // existentes (a diferencia de boards/columnas, exclusivas de OWNER/ADMIN) —
@@ -87,18 +87,31 @@ async function requireColumnContext(columnId: string) {
 
 /** Resuelve una tarea no borrada junto con su columna/board/workspace y
  * verifica que `userId` sea miembro de ese workspace. Si la tarea no existe,
- * está soft-deleted, su board está borrado, o el usuario no es miembro, lanza
- * el mismo 404 uniforme — no revela si el recurso existe pero es ajeno (mismo
- * criterio que modules/workspaces). */
+ * está soft-deleted, su board o su workspace están borrados, o el usuario no
+ * es miembro, lanza el mismo 404 uniforme — no revela si el recurso existe
+ * pero es ajeno (mismo criterio que modules/workspaces).
+ *
+ * Hallazgo de security-reviewer (feature "Mi día"): hasta esta corrección
+ * solo se chequeaba `board.deletedAt`, nunca `workspace.deletedAt` —
+ * `deleteWorkspace` (workspaces.service.ts) no cascadea el soft-delete a sus
+ * Board ni limpia WorkspaceMember, así que una tarea de un workspace ya
+ * "borrado" seguía siendo accesible por id mientras la membresía no se
+ * limpiara (que tampoco ocurre hoy). Corregido acá, en el único punto común,
+ * para cubrir de una sola vez a todo lo que depende de requireTaskAccess. */
 async function requireTaskAccess(taskId: string, userId: string) {
   const notFoundError = new AppError(404, 'TASK_NOT_FOUND', 'La tarea no existe.');
 
   const task = await prisma.task.findUnique({
     where: { id: taskId },
-    include: { column: { include: { board: true } } },
+    include: { column: { include: { board: { include: { workspace: true } } } } },
   });
 
-  if (!task || task.deletedAt !== null || task.column.board.deletedAt !== null) {
+  if (
+    !task ||
+    task.deletedAt !== null ||
+    task.column.board.deletedAt !== null ||
+    task.column.board.workspace.deletedAt !== null
+  ) {
     throw notFoundError;
   }
 
@@ -220,7 +233,15 @@ async function listTasksByBoard(
   userId: string,
   priority?: ListTasksQuery['priority'],
 ): Promise<TaskDto[]> {
-  const board = await prisma.board.findFirst({ where: { id: boardId, deletedAt: null } });
+  // Chequea también workspace.deletedAt, no solo board.deletedAt — un
+  // workspace borrado (DELETE /workspaces/:id) no cascadea el soft-delete a
+  // sus Board, así que sin esto un board de un workspace ya "borrado" seguía
+  // siendo listable mientras la membresía no se limpiara (que tampoco ocurre
+  // hoy). Mismo hallazgo de security-reviewer ya corregido en
+  // requireTaskAccess — ver ese comentario para el detalle completo.
+  const board = await prisma.board.findFirst({
+    where: { id: boardId, deletedAt: null, workspace: { deletedAt: null } },
+  });
   if (!board) {
     throw new AppError(404, 'BOARD_NOT_FOUND', 'El board no existe.');
   }
@@ -554,6 +575,97 @@ async function deleteSubtask(taskId: string, subtaskId: string, userId: string):
   await prisma.subtask.delete({ where: { id: subtask.id } });
 }
 
+const ASSIGNED_WITH_DUE_DATE_LIMIT = 10;
+
+/** Para la parte automática de "Mi día" — tareas asignadas al usuario que
+ * tienen una fecha límite (`dueAt`), cruzando todos sus workspaces, mismo
+ * criterio de membresía vigente que remindersService.listUpcomingForUser.
+ * Decisión: las asignadas SIN fecha límite no entran acá automáticamente
+ * (no hay forma de ordenarlas por "urgencia hoy" sin convertir fechas en el
+ * backend, algo que CLAUDE.md prohíbe) — si el usuario las quiere ver en su
+ * día, las agrega a mano vía MyDayTask. Documentado en PROGRESS.md. */
+async function listAssignedWithDueDate(userId: string): Promise<TaskDto[]> {
+  const tasks = await prisma.task.findMany({
+    where: {
+      assigneeId: userId,
+      deletedAt: null,
+      dueAt: { not: null },
+      column: {
+        board: {
+          deletedAt: null,
+          workspace: { deletedAt: null, members: { some: { userId } } },
+        },
+      },
+    },
+    orderBy: { dueAt: 'asc' },
+    take: ASSIGNED_WITH_DUE_DATE_LIMIT,
+  });
+
+  return tasks.map(toTaskDto);
+}
+
+// --- "Mi día" (MyDayTask): marca personal, sin rol/permiso de mutación de
+// por medio — cualquier miembro del workspace (incluido VIEWER) puede
+// agregar/quitar una tarea de SU PROPIO "Mi día", esté o no asignada a él.
+// requireTaskAccess ya basta como chequeo de permisos: no se exige
+// requireMutationRole porque esto no modifica la tarea en sí, solo un
+// marcador privado del usuario que la agrega.
+
+/** Idempotente: si ya estaba agregada, no hace nada (no es un error). */
+async function addTaskToMyDay(taskId: string, userId: string): Promise<void> {
+  await requireTaskAccess(taskId, userId);
+
+  await prisma.myDayTask.upsert({
+    where: { userId_taskId: { userId, taskId } },
+    update: {},
+    create: { userId, taskId },
+  });
+}
+
+/** Idempotente: si no estaba agregada, no hace nada (no es un error) — a
+ * diferencia de deleteSubtask, acá no tiene sentido un 404 por "ya no está":
+ * el resultado final que le importa al usuario (que no esté en su Mi día)
+ * ya se cumple sin que haga falta distinguir el caso. */
+async function removeTaskFromMyDay(taskId: string, userId: string): Promise<void> {
+  await requireTaskAccess(taskId, userId);
+
+  await prisma.myDayTask.deleteMany({ where: { userId, taskId } });
+}
+
+/** Tareas que el usuario agregó a su "Mi día", cruzando todos sus workspaces
+ * — mismo criterio que remindersService.listUpcomingForUser: filtra por
+ * membresía vigente y tarea/board no borrados, para que una marca vieja no
+ * resucite una tarea ya inaccesible. Más reciente agregada primero. */
+async function listMyDayTasks(userId: string): Promise<MyDayTaskDto[]> {
+  const entries = await prisma.myDayTask.findMany({
+    where: {
+      userId,
+      task: {
+        deletedAt: null,
+        column: {
+          board: {
+            deletedAt: null,
+            workspace: { deletedAt: null, members: { some: { userId } } },
+          },
+        },
+      },
+    },
+    orderBy: { addedAt: 'desc' },
+    include: {
+      task: {
+        include: { column: { include: { board: true } } },
+      },
+    },
+  });
+
+  return entries.map((entry) => ({
+    addedAt: entry.addedAt.toISOString(),
+    task: toTaskDto(entry.task),
+    board: { id: entry.task.column.board.id, name: entry.task.column.board.name },
+    workspaceId: entry.task.column.board.workspaceId,
+  }));
+}
+
 export const tasksService = {
   createTask,
   listTasksByBoard,
@@ -565,4 +677,8 @@ export const tasksService = {
   createSubtask,
   updateSubtask,
   deleteSubtask,
+  addTaskToMyDay,
+  removeTaskFromMyDay,
+  listMyDayTasks,
+  listAssignedWithDueDate,
 };

@@ -297,7 +297,10 @@ async function updateMemberRole(
   targetUserId: string,
   input: UpdateMemberRoleInput,
 ): Promise<WorkspaceMemberDto> {
-  const { membership: actingMembership } = await requireMembership(workspaceId, actingUserId);
+  const { workspace, membership: actingMembership } = await requireMembership(
+    workspaceId,
+    actingUserId,
+  );
   requireOwnerOrAdmin(actingMembership);
 
   const targetMembership = await getMembership(workspaceId, targetUserId);
@@ -331,6 +334,25 @@ async function updateMemberRole(
       },
     }),
   ]);
+
+  // Notifica a la persona afectada — sin esto, su rol cambiaba sin que se
+  // enterara hasta la próxima vez que recargara la página a mano (bug
+  // reportado por el usuario probando roles por tablero: la pestaña ya
+  // abierta de la persona afectada nunca se enteraba). No se notifica si se
+  // cambia el rol a sí mismo (ya lo sabe, fue quien lo hizo). Fuera de la
+  // transacción de arriba a propósito — best-effort, nunca debe poder
+  // tumbar el cambio de rol en sí si algo saliera mal acá.
+  if (targetUserId !== actingUserId) {
+    const notification = await prisma.notification.create({
+      data: {
+        userId: targetUserId,
+        type: 'ROLE_CHANGED',
+        title: 'Tu rol cambió',
+        body: `Ahora sos ${input.role} en el workspace "${workspace.name}".`,
+      },
+    });
+    pushNotification(notification);
+  }
 
   return {
     userId: updated.userId,
