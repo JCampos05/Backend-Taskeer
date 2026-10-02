@@ -611,6 +611,17 @@ async function listAssignedWithDueDate(userId: string): Promise<TaskDto[]> {
 // requireMutationRole porque esto no modifica la tarea en sí, solo un
 // marcador privado del usuario que la agrega.
 
+/** Usado por el Frontend al abrir el modal de una tarea existente, para
+ * saber si el botón de "Mi día" debe mostrarse activo. */
+async function isTaskInMyDay(taskId: string, userId: string): Promise<boolean> {
+  await requireTaskAccess(taskId, userId);
+
+  const entry = await prisma.myDayTask.findUnique({
+    where: { userId_taskId: { userId, taskId } },
+  });
+  return entry !== null;
+}
+
 /** Idempotente: si ya estaba agregada, no hace nada (no es un error). */
 async function addTaskToMyDay(taskId: string, userId: string): Promise<void> {
   await requireTaskAccess(taskId, userId);
@@ -677,6 +688,7 @@ export const tasksService = {
   createSubtask,
   updateSubtask,
   deleteSubtask,
+  isTaskInMyDay,
   addTaskToMyDay,
   removeTaskFromMyDay,
   listMyDayTasks,

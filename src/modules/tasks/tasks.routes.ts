@@ -89,6 +89,13 @@ tasksRouter.delete(
 
 // --- "Mi día" (marca personal, ver tasks.service.ts) ---
 
+tasksRouter.get(
+  '/tasks/:taskId/my-day',
+  requireAuth,
+  validate(taskIdParamSchema),
+  tasksController.getMyDayStatus,
+);
+
 tasksRouter.put(
   '/tasks/:taskId/my-day',
   requireAuth,
