@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { env } from './config/env';
 import { errorHandler } from './middlewares/errorHandler';
 import { authRouter } from './modules/auth/auth.routes';
+import { billingRouter } from './modules/billing/billing.routes';
 import { boardsRouter } from './modules/boards/boards.routes';
 import { myDayRouter } from './modules/my-day/my-day.routes';
 import { notificationsRouter } from './modules/notifications/notifications.routes';
@@ -63,6 +64,7 @@ apiRouter.use(remindersRouter);
 apiRouter.use(notificationsRouter);
 apiRouter.use(preferencesRouter);
 apiRouter.use(myDayRouter);
+apiRouter.use(billingRouter);
 // Un módulo nuevo de dominio nunca debe quedar huérfano sin montar aquí.
 
 app.use('/api/v1', apiRouter);

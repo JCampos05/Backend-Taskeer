@@ -71,6 +71,7 @@ export const createColumnSchema = z.object({
       .min(1, 'El nombre de la columna es obligatorio.')
       .max(100, 'El nombre de la columna es demasiado largo.'),
     wipLimit: wipLimitField,
+    isDoneColumn: z.boolean().optional(),
   }),
 });
 
@@ -94,10 +95,18 @@ export const updateColumnSchema = z.object({
         .min(0, 'La posición no puede ser negativa.')
         .optional(),
       wipLimit: wipLimitField,
+      isDoneColumn: z.boolean().optional(),
     })
     .refine(
-      (data) => data.name !== undefined || data.position !== undefined || data.wipLimit !== undefined,
-      { message: 'Debes enviar al menos un campo para actualizar (name, position o wipLimit).' },
+      (data) =>
+        data.name !== undefined ||
+        data.position !== undefined ||
+        data.wipLimit !== undefined ||
+        data.isDoneColumn !== undefined,
+      {
+        message:
+          'Debes enviar al menos un campo para actualizar (name, position, wipLimit o isDoneColumn).',
+      },
     ),
 });
 

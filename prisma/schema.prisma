@@ -420,6 +420,18 @@ model Column {
   // ilimitado. Configurable por OWNER/ADMIN del workspace, igual que el
   // resto de columna/board (docs/07-alcance-mvp.md, "Kanban").
   wipLimit  Int?
+  // Marca estructural de "esta columna representa tarea terminada" — antes
+  // de este campo no existía NINGUNA señal de completitud en el modelo de
+  // datos, solo la convención de nombre "Hecho" que siembra el seed
+  // (boards.service.ts, DEFAULT_COLUMN_NAMES), rompible con solo renombrar
+  // o agregar una columna después. Usado por "Mi día" (modules/tasks,
+  // modules/my-day) para no mostrar como pendiente una tarea ya terminada.
+  // Un board puede tener más de una columna marcada (ej. "Hecho" y
+  // "Archivado") — configurable por OWNER/ADMIN al crear/editar la columna,
+  // igual que wipLimit. Nombre con prefijo is+Column (no solo "isDone") a
+  // propósito: distingue "esta es la columna de terminadas" de un futuro
+  // Task.isDone que signifique otra cosa ("esta tarea puntual ya se hizo").
+  isDoneColumn Boolean @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

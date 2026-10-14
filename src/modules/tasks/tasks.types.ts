@@ -20,6 +20,14 @@ export interface TaskDto {
   updatedAt: string;
 }
 
+// Para "Mi día" — tarea asignada automáticamente (por tener `dueAt`), con el
+// contexto de tablero/workspace ya resuelto. Mismo motivo que MyDayTaskDto.
+export interface AssignedTaskDto {
+  task: TaskDto;
+  board: { id: string; name: string };
+  workspaceId: string;
+}
+
 // Para "Mi día" — tarea que el propio usuario marcó personalmente (sea que
 // esté asignada a él o no), con el contexto de tablero/workspace ya resuelto
 // (mismo motivo que UpcomingReminderDto en reminders.types.ts: el Frontend

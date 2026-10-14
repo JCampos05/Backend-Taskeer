@@ -9,7 +9,7 @@ import type { EntitlementKey } from './entitlements.types';
  * anterior (más generoso). Se evalúa en el momento de la lectura, no
  * depende de que un job de limpieza ya haya corrido — ver
  * docs/08-planes-suscripciones.md. */
-function resolveEffectivePlanId(subscription: {
+export function resolveEffectivePlanId(subscription: {
   planId: string;
   previousPlanId: string | null;
   downgradeGraceEndsAt: Date | null;
@@ -71,7 +71,20 @@ async function resolveEntitlement(userId: string, key: EntitlementKey): Promise<
  * un número, o `null` si el plan dice "unlimited". */
 async function getWorkspacesOwnedMax(userId: string): Promise<number | null> {
   const valor = await resolveEntitlement(userId, 'workspaces.owned.max');
-  return valor === 'unlimited' ? null : Number(valor);
+  if (valor === 'unlimited') return null;
+
+  // Un valor mal formado (texto, vacío, decimal) NO debe leerse como
+  // "ilimitado" — Number() daría NaN, que JSON serializa como null y el
+  // consumidor interpretaría como sin límite (fallo abierto).
+  const numero = Number(valor);
+  if (!Number.isInteger(numero) || numero < 0) {
+    throw new AppError(
+      500,
+      'ENTITLEMENT_NOT_CONFIGURED',
+      'No se pudo resolver un límite de tu plan.',
+    );
+  }
+  return numero;
 }
 
 /** Azúcar para claves booleanas ("true"/"false"). */

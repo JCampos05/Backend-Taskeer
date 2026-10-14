@@ -11,7 +11,7 @@ import type {
   UpdateSubtaskInput,
   UpdateTaskInput,
 } from './tasks.schema';
-import type { MyDayTaskDto, SubtaskDto, TaskDto } from './tasks.types';
+import type { AssignedTaskDto, MyDayTaskDto, SubtaskDto, TaskDto } from './tasks.types';
 
 // EDITOR sí puede crear/mover/editar/borrar Task dentro de columnas ya
 // existentes (a diferencia de boards/columnas, exclusivas de OWNER/ADMIN) —
@@ -575,6 +575,35 @@ async function deleteSubtask(taskId: string, subtaskId: string, userId: string):
   await prisma.subtask.delete({ where: { id: subtask.id } });
 }
 
+/** Cuántas tareas asignadas al usuario están vencidas (`dueAt` ya pasó),
+ * cruzando TODOS sus workspaces propios y compartidos — a propósito un
+ * concepto separado de "Mi día" (no deriva de listAssignedWithDueDate, que
+ * está recortado a `ASSIGNED_WITH_DUE_DATE_LIMIT` filas para ese dashboard
+ * puntual): esto es un conteo real a nivel sistema, sin límite, pensado
+ * para un aviso tipo "tienes N tareas vencidas" en Inicio. Mismo criterio de
+ * membresía vigente y columna no completada que el resto de este archivo.
+ * `dueAt: { lt: new Date() }` es una comparación de instantes contra el
+ * reloj del servidor, no una conversión de zona horaria — mismo patrón ya
+ * usado en reminders.worker.ts (`remindAt: { lte: new Date() }`), no viola
+ * la regla de CLAUDE.md de nunca convertir fechas a hora local en el
+ * backend. */
+async function countOverdueForUser(userId: string): Promise<number> {
+  return prisma.task.count({
+    where: {
+      assigneeId: userId,
+      deletedAt: null,
+      dueAt: { lt: new Date() },
+      column: {
+        isDoneColumn: false,
+        board: {
+          deletedAt: null,
+          workspace: { deletedAt: null, members: { some: { userId } } },
+        },
+      },
+    },
+  });
+}
+
 const ASSIGNED_WITH_DUE_DATE_LIMIT = 10;
 
 /** Para la parte automática de "Mi día" — tareas asignadas al usuario que
@@ -584,13 +613,18 @@ const ASSIGNED_WITH_DUE_DATE_LIMIT = 10;
  * (no hay forma de ordenarlas por "urgencia hoy" sin convertir fechas en el
  * backend, algo que CLAUDE.md prohíbe) — si el usuario las quiere ver en su
  * día, las agrega a mano vía MyDayTask. Documentado en PROGRESS.md. */
-async function listAssignedWithDueDate(userId: string): Promise<TaskDto[]> {
+async function listAssignedWithDueDate(userId: string): Promise<AssignedTaskDto[]> {
   const tasks = await prisma.task.findMany({
     where: {
       assigneeId: userId,
       deletedAt: null,
       dueAt: { not: null },
       column: {
+        // No mostrar como pendiente lo que ya está en una columna de
+        // completadas (Column.isDoneColumn) — antes de que ese campo
+        // existiera, una tarea en "Hecho" seguía apareciendo acá como si
+        // faltara hacerla.
+        isDoneColumn: false,
         board: {
           deletedAt: null,
           workspace: { deletedAt: null, members: { some: { userId } } },
@@ -599,9 +633,16 @@ async function listAssignedWithDueDate(userId: string): Promise<TaskDto[]> {
     },
     orderBy: { dueAt: 'asc' },
     take: ASSIGNED_WITH_DUE_DATE_LIMIT,
+    include: {
+      column: { include: { board: true } },
+    },
   });
 
-  return tasks.map(toTaskDto);
+  return tasks.map((task) => ({
+    task: toTaskDto(task),
+    board: { id: task.column.board.id, name: task.column.board.name },
+    workspaceId: task.column.board.workspaceId,
+  }));
 }
 
 // --- "Mi día" (MyDayTask): marca personal, sin rol/permiso de mutación de
@@ -654,6 +695,10 @@ async function listMyDayTasks(userId: string): Promise<MyDayTaskDto[]> {
       task: {
         deletedAt: null,
         column: {
+          // Mismo criterio que listAssignedWithDueDate — si el usuario
+          // terminó la tarea después de marcarla, deja de mostrarse como
+          // pendiente en "Mi día" aunque la marca manual siga existiendo.
+          isDoneColumn: false,
           board: {
             deletedAt: null,
             workspace: { deletedAt: null, members: { some: { userId } } },
@@ -693,4 +738,5 @@ export const tasksService = {
   removeTaskFromMyDay,
   listMyDayTasks,
   listAssignedWithDueDate,
+  countOverdueForUser,
 };

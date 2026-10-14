@@ -118,6 +118,15 @@ async function removeSubtask(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+async function getOverdueCount(req: Request, res: Response, next: NextFunction) {
+  try {
+    const count = await tasksService.countOverdueForUser(req.auth!.sub);
+    res.status(200).json({ count });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function getMyDayStatus(req: Request, res: Response, next: NextFunction) {
   try {
     const { taskId } = req.params as unknown as TaskIdParams;
@@ -159,6 +168,7 @@ export const tasksController = {
   createSubtask,
   updateSubtask,
   removeSubtask,
+  getOverdueCount,
   getMyDayStatus,
   addToMyDay,
   removeFromMyDay,

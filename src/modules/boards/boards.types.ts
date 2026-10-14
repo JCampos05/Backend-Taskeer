@@ -18,6 +18,10 @@ export interface ColumnDto {
   position: number;
   // null = sin límite de tareas simultáneas en esta columna.
   wipLimit: number | null;
+  // true = las tareas de esta columna cuentan como terminadas (ver
+  // schema.prisma, Column.isDoneColumn) — "Mi día" las excluye de lo
+  // pendiente. Un board puede tener más de una columna marcada así.
+  isDoneColumn: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -43,6 +47,10 @@ export interface TaskSummaryDto {
   // pedir los subtasks de cada tarea por separado.
   subtaskTotal: number;
   subtaskCompletado: number;
+  // Si ESTE usuario (quien pidió el board) ya la agregó a su "Mi día" — ver
+  // Column.isDoneColumn/MyDayTask en schema.prisma. Nunca la marca de otro
+  // miembro, es personal.
+  inMyDay: boolean;
 }
 
 export interface ColumnWithTasksDto extends ColumnDto {

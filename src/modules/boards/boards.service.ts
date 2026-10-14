@@ -46,6 +46,7 @@ function toColumnDto(column: {
   name: string;
   position: number;
   wipLimit: number | null;
+  isDoneColumn: boolean;
   createdAt: Date;
   updatedAt: Date;
 }): ColumnDto {
@@ -55,6 +56,7 @@ function toColumnDto(column: {
     name: column.name,
     position: column.position,
     wipLimit: column.wipLimit,
+    isDoneColumn: column.isDoneColumn,
     createdAt: column.createdAt.toISOString(),
     updatedAt: column.updatedAt.toISOString(),
   };
@@ -213,12 +215,15 @@ async function createBoard(
     });
 
     // Siembra las columnas predefinidas en la misma transacción — un Board
-    // nunca existe sin ellas (ver docs/07-alcance-mvp.md).
+    // nunca existe sin ellas (ver docs/07-alcance-mvp.md). "Hecho" nace ya
+    // marcada como columna de completadas (ver Column.isDoneColumn en
+    // schema.prisma) — el usuario puede desmarcarla o marcar otras después.
     await tx.column.createMany({
       data: DEFAULT_COLUMN_NAMES.map((name, position) => ({
         boardId: createdBoard.id,
         name,
         position,
+        isDoneColumn: name === 'Hecho',
       })),
     });
 
@@ -270,6 +275,22 @@ async function getBoardById(
     },
   });
 
+  // Qué tareas de ESTE board ya están en el "Mi día" de quien pide el
+  // detalle — una sola query en vez de N (una por tarjeta) para que el
+  // botón de marcar/desmarcar en el tablero no dispare un request por
+  // tarea al cargar. Es la marca de ESTE usuario únicamente (MyDayTask no
+  // tiene noción de "equipo", ver schema.prisma) — nunca se expone la de
+  // otro miembro.
+  const taskIds = columns.flatMap((column) => column.tasks.map((task) => task.id));
+  const myDayTaskIds = new Set(
+    (
+      await prisma.myDayTask.findMany({
+        where: { userId, taskId: { in: taskIds } },
+        select: { taskId: true },
+      })
+    ).map((entry) => entry.taskId),
+  );
+
   return {
     ...toBoardDto(board),
     viewerEffectiveRole,
@@ -286,6 +307,7 @@ async function getBoardById(
         assigneeId: task.assigneeId,
         subtaskTotal: task.subtasks.length,
         subtaskCompletado: task.subtasks.filter((s) => s.completed).length,
+        inMyDay: myDayTaskIds.has(task.id),
       })),
     })),
   };
@@ -360,7 +382,13 @@ async function createColumn(
   const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
   const column = await prisma.column.create({
-    data: { boardId, name: input.name, position: nextPosition, wipLimit: input.wipLimit ?? null },
+    data: {
+      boardId,
+      name: input.name,
+      position: nextPosition,
+      wipLimit: input.wipLimit ?? null,
+      isDoneColumn: input.isDoneColumn ?? false,
+    },
   });
 
   return toColumnDto(column);
@@ -385,7 +413,7 @@ async function updateColumn(
   if (input.position === undefined) {
     const updated = await prisma.column.update({
       where: { id: columnId },
-      data: { name: input.name, wipLimit: input.wipLimit },
+      data: { name: input.name, wipLimit: input.wipLimit, isDoneColumn: input.isDoneColumn },
     });
     return toColumnDto(updated);
   }
@@ -415,6 +443,7 @@ async function updateColumn(
         name: input.name ?? column.name,
         position: clampedPosition,
         wipLimit: input.wipLimit !== undefined ? input.wipLimit : column.wipLimit,
+        isDoneColumn: input.isDoneColumn !== undefined ? input.isDoneColumn : column.isDoneColumn,
       },
     }),
   ]);

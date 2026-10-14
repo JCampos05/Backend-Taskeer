@@ -25,6 +25,12 @@ export const tasksRouter = Router();
 // método de tasks.service.ts verifica membresía/rol explícitamente contra
 // WorkspaceMember antes de cada acción.
 
+// Nivel raíz bajo /me, no bajo /tasks — concepto a nivel sistema
+// (independiente de "Mi día", ver tasksService.countOverdueForUser),
+// cruza todos los workspaces del usuario. Mismo patrón que
+// GET /me/reminders/upcoming en modules/reminders.
+tasksRouter.get('/me/tasks/overdue-count', requireAuth, tasksController.getOverdueCount);
+
 tasksRouter.post('/tasks', requireAuth, validate(createTaskSchema), tasksController.create);
 
 tasksRouter.get('/tasks', requireAuth, validate(listTasksSchema), tasksController.list);

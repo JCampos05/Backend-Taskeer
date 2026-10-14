@@ -3,7 +3,7 @@
 // (ver my-day.service.ts). El Backend no comparte paquete de tipos con el
 // Frontend por ahora — cada uno define los suyos (ver docs/01-arquitectura.md).
 
-import type { MyDayTaskDto, TaskDto } from '../tasks/tasks.types';
+import type { AssignedTaskDto, MyDayTaskDto } from '../tasks/tasks.types';
 import type { UpcomingReminderDto } from '../reminders/reminders.types';
 import type { MyInvitationDto } from '../workspaces/workspaces.types';
 
@@ -12,7 +12,7 @@ export interface MyDayDto {
   pinnedTasks: MyDayTaskDto[];
   // Asignadas automáticamente al usuario y con fecha límite — ver
   // tasksService.listAssignedWithDueDate.
-  assignedTasks: TaskDto[];
+  assignedTasks: AssignedTaskDto[];
   // Recordatorios pendientes de sus tareas asignadas — reusa
   // remindersService.listUpcomingForUser tal cual (misma fuente que ya
   // consume views/inicio).
