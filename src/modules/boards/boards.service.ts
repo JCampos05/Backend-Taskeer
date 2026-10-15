@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { Prisma } from '@prisma/client';
 import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
@@ -6,11 +7,18 @@ import { pushNotification } from '../notifications/notifications.stream';
 import type {
   CreateBoardInput,
   CreateColumnInput,
+  MoveBoardsInput,
   SetBoardMemberOverrideInput,
   UpdateBoardInput,
   UpdateColumnInput,
 } from './boards.schema';
-import type { BoardDetailDto, BoardDto, BoardMemberOverrideDto, ColumnDto } from './boards.types';
+import type {
+  BoardDetailDto,
+  BoardDto,
+  BoardMemberOverrideDto,
+  ColumnDto,
+  MoveBoardsResultDto,
+} from './boards.types';
 
 // Roles con permiso para crear/renombrar/borrar boards y columnas — ver
 // docs/02-modelo-datos.md, sección WorkspaceMember. EDITOR puede tocar Task
@@ -624,7 +632,190 @@ async function removeBoardMemberOverride(
   }
 }
 
+/** Mueve tableros (con sus columnas, tareas, subtareas y recordatorios) a otro
+ * workspace, todo en una sola transacción — o se mueven todos o ninguno.
+ *
+ * Permisos: hace falta ser OWNER/ADMIN en el workspace de origen Y en el de
+ * destino (membresía cruda), y además tener rol efectivo OWNER/ADMIN en CADA
+ * tablero que se mueve — igual que deleteBoard: quien fue restringido en un
+ * tablero con un override no puede sacarlo del workspace. Un destino
+ * inexistente, borrado o del que no se es miembro responde 404 uniforme.
+ *
+ * Qué se ajusta porque dependía de pertenecer al workspace de origen:
+ *  - Tareas/subtareas asignadas a alguien que NO es miembro del destino quedan
+ *    sin asignar (el invariante "el asignado es miembro del workspace" se
+ *    mantiene).
+ *  - Se eliminan TODOS los roles por tablero (BoardMemberOverride): los
+ *    concedió el OWNER/ADMIN del workspace de origen y no deben viajar al
+ *    destino (si no, un VIEWER de allí con override ADMIN en el origen
+ *    quedaría con rango que nadie del destino le dio). Quien se quede con
+ *    acceso lo tiene por su rol de workspace en el destino.
+ *  - Las marcas de "Mi día" de quien no es miembro del destino se eliminan.
+ *  - El slug se conserva si está libre en el destino; si no, se le agrega un
+ *    sufijo.
+ * Las personas del origen que no están en el destino pierden acceso a esos
+ * tableros — es el efecto buscado de moverlos. */
+async function moveBoards(
+  workspaceId: string,
+  userId: string,
+  input: MoveBoardsInput,
+): Promise<MoveBoardsResultDto> {
+  if (input.targetWorkspaceId === workspaceId) {
+    throw new AppError(400, 'SAME_WORKSPACE', 'El workspace destino debe ser distinto del actual.');
+  }
+  const targetWorkspaceId = input.targetWorkspaceId;
+
+  // Verificación temprana (falla rápido con 404/403 uniformes); se repite dentro
+  // de la transacción para no depender de datos que pudieron cambiar.
+  const { membership: sourceMembership } = await requireMembership(workspaceId, userId);
+  requireOwnerOrAdmin(sourceMembership.role);
+  const { membership: targetMembership } = await requireMembership(targetWorkspaceId, userId);
+  requireOwnerOrAdmin(targetMembership.role);
+
+  const boardIds = [...new Set(input.boardIds)];
+
+  try {
+    return await prisma.$transaction(
+      async (tx) => {
+        // --- Revalidación dentro de la transacción ---
+        const [source, target] = await Promise.all([
+          tx.workspaceMember.findUnique({
+            where: { workspaceId_userId: { workspaceId, userId } },
+            include: { workspace: { select: { deletedAt: true } } },
+          }),
+          tx.workspaceMember.findUnique({
+            where: { workspaceId_userId: { workspaceId: targetWorkspaceId, userId } },
+            include: { workspace: { select: { deletedAt: true } } },
+          }),
+        ]);
+        if (!source || source.workspace.deletedAt) {
+          throw new AppError(404, 'WORKSPACE_NOT_FOUND', 'El workspace no existe.');
+        }
+        if (!target || target.workspace.deletedAt) {
+          throw new AppError(404, 'WORKSPACE_NOT_FOUND', 'El workspace no existe.');
+        }
+        requireOwnerOrAdmin(source.role);
+        requireOwnerOrAdmin(target.role);
+
+        const boards = await tx.board.findMany({
+          where: { id: { in: boardIds }, workspaceId, deletedAt: null },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (boards.length !== boardIds.length) {
+          throw new AppError(404, 'BOARD_NOT_FOUND', 'El board no existe.');
+        }
+
+        // Rol efectivo por tablero: un override restrictivo impide moverlo.
+        for (const board of boards) {
+          requireOwnerOrAdmin(await resolveEffectiveRole(board.id, source));
+        }
+
+        const targetMemberIds = (
+          await tx.workspaceMember.findMany({
+            where: { workspaceId: targetWorkspaceId },
+            select: { userId: true },
+          })
+        ).map((m) => m.userId);
+
+        const moved: BoardDto[] = [];
+        let tasksUnassigned = 0;
+        let subtasksUnassigned = 0;
+        let overridesRemoved = 0;
+
+        for (const board of boards) {
+          // Slug libre en el destino (se consulta dentro de la transacción para
+          // ver también los tableros ya movidos en esta misma operación). La
+          // base se recorta ANTES de agregar el sufijo para no perderlo.
+          let slug = board.slug;
+          for (let n = 2; ; n += 1) {
+            const taken = await tx.board.findUnique({
+              where: { workspaceId_slug: { workspaceId: targetWorkspaceId, slug } },
+            });
+            if (!taken) break;
+            if (n > 50) {
+              throw new AppError(
+                500,
+                'SLUG_GENERATION_FAILED',
+                'No se pudo generar un identificador único para el board. Intenta de nuevo.',
+              );
+            }
+            const sufijo = `-${n}`;
+            slug = `${board.slug.slice(0, 160 - sufijo.length)}${sufijo}`;
+          }
+
+          // updateMany con las mismas condiciones de origen: si el tablero ya se
+          // movió o se borró en paralelo, no se mueve dos veces.
+          const result = await tx.board.updateMany({
+            where: { id: board.id, workspaceId, deletedAt: null },
+            data: { workspaceId: targetWorkspaceId, slug },
+          });
+          if (result.count !== 1) {
+            throw new AppError(404, 'BOARD_NOT_FOUND', 'El board no existe.');
+          }
+
+          const tasks = await tx.task.updateMany({
+            where: {
+              column: { boardId: board.id },
+              assigneeId: { not: null, notIn: targetMemberIds },
+            },
+            data: { assigneeId: null },
+          });
+          const subtasks = await tx.subtask.updateMany({
+            where: {
+              task: { column: { boardId: board.id } },
+              assigneeId: { not: null, notIn: targetMemberIds },
+            },
+            data: { assigneeId: null },
+          });
+          const overrides = await tx.boardMemberOverride.deleteMany({
+            where: { boardId: board.id },
+          });
+          await tx.myDayTask.deleteMany({
+            where: { task: { column: { boardId: board.id } }, userId: { notIn: targetMemberIds } },
+          });
+
+          tasksUnassigned += tasks.count;
+          subtasksUnassigned += subtasks.count;
+          overridesRemoved += overrides.count;
+
+          await tx.auditLog.create({
+            data: {
+              userId,
+              action: 'board.moved',
+              metadata: {
+                boardId: board.id,
+                fromWorkspaceId: workspaceId,
+                toWorkspaceId: targetWorkspaceId,
+                originalSlug: board.slug,
+                newSlug: slug,
+                tasksUnassigned: tasks.count,
+                subtasksUnassigned: subtasks.count,
+                overridesRemoved: overrides.count,
+              },
+            },
+          });
+
+          const updated = await tx.board.findUniqueOrThrow({ where: { id: board.id } });
+          moved.push(toBoardDto(updated));
+        }
+
+        return { boards: moved, tasksUnassigned, subtasksUnassigned, overridesRemoved };
+      },
+      // Hasta 50 tableros, varias consultas cada uno: el timeout por defecto de
+      // Prisma (5 s) se queda corto contra una base remota.
+      { timeout: 30_000, maxWait: 5_000 },
+    );
+  } catch (err) {
+    // Creación concurrente de un tablero con el mismo slug en el destino.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      throw new AppError(409, 'SLUG_CONFLICT', 'Hubo un conflicto al mover el tablero. Intenta de nuevo.');
+    }
+    throw err;
+  }
+}
+
 export const boardsService = {
+  moveBoards,
   createBoard,
   listBoards,
   getBoardById,

@@ -31,11 +31,24 @@ async function ejecutarCorrida(): Promise<void> {
 async function dispararRecordatoriosVencidos(): Promise<void> {
   const vencidos = await prisma.reminder.findMany({
     where: { status: 'PENDING', remindAt: { lte: new Date() } },
-    include: { task: true },
+    include: { task: { include: { column: { include: { board: { include: { workspace: true } } } } } } },
   });
 
   for (const recordatorio of vencidos) {
     try {
+      // Si la tarea, su tablero o su workspace fueron eliminados (soft delete),
+      // nadie puede abrir esa tarea: no se notifica un aviso que lleva a un
+      // recurso inaccesible. Se descarta (DISMISSED) en vez de dejarlo PENDING,
+      // que lo reintentaría cada minuto para siempre.
+      const { task } = recordatorio;
+      if (task.deletedAt || task.column.board.deletedAt || task.column.board.workspace.deletedAt) {
+        await prisma.reminder.updateMany({
+          where: { id: recordatorio.id, status: 'PENDING' },
+          data: { status: 'DISMISSED' },
+        });
+        continue;
+      }
+
       await dispararUno(recordatorio.id, recordatorio.taskId, recordatorio.task.title, recordatorio.task.assigneeId);
     } catch (err) {
       // Un recordatorio que falla no debe tumbar el resto de la corrida.

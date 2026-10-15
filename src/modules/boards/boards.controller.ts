@@ -6,6 +6,7 @@ import type {
   ColumnParams,
   CreateBoardInput,
   CreateColumnInput,
+  MoveBoardsInput,
   SetBoardMemberOverrideInput,
   UpdateBoardInput,
   UpdateColumnInput,
@@ -14,6 +15,17 @@ import type {
 
 // El controller nunca llama a Prisma directamente ni contiene lógica de
 // negocio — solo adapta req/res y delega todo a boards.service.
+
+async function move(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { workspaceId } = req.params as unknown as WorkspaceIdParams;
+    const input = req.body as MoveBoardsInput;
+    const result = await boardsService.moveBoards(workspaceId, req.auth!.sub, input);
+    res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
 
 async function create(req: Request, res: Response, next: NextFunction) {
   try {
@@ -147,6 +159,7 @@ async function removeMemberOverride(req: Request, res: Response, next: NextFunct
 }
 
 export const boardsController = {
+  move,
   create,
   list,
   getById,

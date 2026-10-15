@@ -13,6 +13,12 @@ export interface WorkspaceDto {
   updatedAt: string;
 }
 
+/** Elemento de GET /workspaces: el workspace más el rol que tiene quien lo pide
+ * (para decidir en la UI qué acciones mostrar). */
+export interface WorkspaceListItemDto extends WorkspaceDto {
+  myRole: 'OWNER' | 'ADMIN' | 'EDITOR' | 'VIEWER';
+}
+
 export interface WorkspaceMemberDto {
   userId: string;
   email: string;

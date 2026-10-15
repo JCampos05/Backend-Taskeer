@@ -17,6 +17,7 @@ import type {
   InvitationDto,
   MyInvitationDto,
   WorkspaceDto,
+  WorkspaceListItemDto,
   WorkspaceMemberDto,
 } from './workspaces.types';
 
@@ -203,14 +204,17 @@ async function createWorkspace(userId: string, input: CreateWorkspaceInput): Pro
   return toWorkspaceDto(workspace);
 }
 
-async function listWorkspaces(userId: string): Promise<WorkspaceDto[]> {
+async function listWorkspaces(userId: string): Promise<WorkspaceListItemDto[]> {
   const memberships = await prisma.workspaceMember.findMany({
     where: { userId, workspace: { deletedAt: null } },
     include: { workspace: true },
     orderBy: { workspace: { createdAt: 'desc' } },
   });
 
-  return memberships.map((membership) => toWorkspaceDto(membership.workspace));
+  return memberships.map((membership) => ({
+    ...toWorkspaceDto(membership.workspace),
+    myRole: membership.role,
+  }));
 }
 
 async function getWorkspaceById(workspaceId: string, userId: string): Promise<WorkspaceDto> {

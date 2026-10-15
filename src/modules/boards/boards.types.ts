@@ -78,3 +78,15 @@ export interface BoardMemberOverrideDto {
   createdAt: string;
   updatedAt: string;
 }
+
+/** Resultado de mover tableros a otro workspace. Los contadores avisan de lo
+ * que hubo que limpiar porque dependía de pertenecer al workspace de origen. */
+export interface MoveBoardsResultDto {
+  boards: BoardDto[];
+  /** Tareas cuyo asignado no es miembro del workspace destino: quedaron sin asignar. */
+  tasksUnassigned: number;
+  /** Subtareas en el mismo caso. */
+  subtasksUnassigned: number;
+  /** Roles por tablero (overrides) de personas que no son miembros del destino. */
+  overridesRemoved: number;
+}

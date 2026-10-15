@@ -128,7 +128,20 @@ export const boardMemberOverrideParamsSchema = z.object({
   params: z.object({ workspaceId: uuidParam, boardId: uuidParam, userId: uuidParam }),
 });
 
+/** Mover uno o varios tableros de un workspace a otro (en una sola transacción). */
+export const moveBoardsSchema = z.object({
+  params: z.object({ workspaceId: uuidParam }),
+  body: z.object({
+    targetWorkspaceId: uuidParam,
+    boardIds: z
+      .array(uuidParam)
+      .min(1, 'Elige al menos un tablero.')
+      .max(50, 'No puedes mover más de 50 tableros a la vez.'),
+  }),
+});
+
 export type WorkspaceIdParams = z.infer<typeof workspaceIdParamSchema>['params'];
+export type MoveBoardsInput = z.infer<typeof moveBoardsSchema>['body'];
 export type CreateBoardInput = z.infer<typeof createBoardSchema>['body'];
 export type BoardIdParams = z.infer<typeof boardIdParamsSchema>['params'];
 export type UpdateBoardInput = z.infer<typeof updateBoardSchema>['body'];

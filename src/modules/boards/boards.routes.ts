@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { requireAuth } from '../../middlewares/requireAuth';
 import { validate } from '../../middlewares/validate';
 import { boardsController } from './boards.controller';
@@ -7,6 +8,7 @@ import {
   boardMemberOverrideParamsSchema,
   columnParamsSchema,
   createBoardSchema,
+  moveBoardsSchema,
   createColumnSchema,
   setBoardMemberOverrideSchema,
   updateBoardSchema,
@@ -16,10 +18,29 @@ import {
 
 export const boardsRouter = Router();
 
+// Mover tableros es una operación pesada (transacción con muchas consultas) y
+// destructiva para quien pierde acceso — límite propio, más estricto que el
+// general de la API.
+const moveBoardsRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Todo lo de boards requiere sesión activa — requireAuth solo resuelve
 // identidad (req.auth), nunca el nivel de permiso dentro del workspace; cada
 // método de boards.service.ts verifica membresía/rol explícitamente contra
 // WorkspaceMember antes de cada acción (mismo patrón que modules/workspaces).
+
+// Antes que las rutas con :boardId para que "move" nunca se lea como un id.
+boardsRouter.post(
+  '/workspaces/:workspaceId/boards/move',
+  requireAuth,
+  moveBoardsRateLimit,
+  validate(moveBoardsSchema),
+  boardsController.move,
+);
 
 boardsRouter.post(
   '/workspaces/:workspaceId/boards',
