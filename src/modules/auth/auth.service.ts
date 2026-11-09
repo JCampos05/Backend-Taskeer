@@ -163,7 +163,9 @@ async function register(input: RegisterInput): Promise<RegisterResultDto> {
   // sin depender de que el correo realmente llegue (ej. sin RESEND_API_KEY
   // configurado todavía). Allowlist explícita (`=== 'development'`) para
   // fallar cerrado por defecto en cualquier otro entorno.
-  void mailService.sendVerificationEmail(user.email, verification.plain);
+  if (env.emailVerificationEnabled) {
+    void mailService.sendVerificationEmail(user.email, verification.plain);
+  }
 
   const plainRecoveryCodes = recoveryCodes.map((rc) => rc.plain);
 
@@ -193,6 +195,14 @@ async function resendVerificationEmail(userId: string): Promise<ResendVerificati
 
   if (user.emailVerifiedAt) {
     return { alreadyVerified: true };
+  }
+
+  if (!env.emailVerificationEnabled) {
+    throw new AppError(
+      503,
+      'EMAIL_VERIFICATION_DISABLED',
+      'La verificación por correo está desactivada por ahora.',
+    );
   }
 
   const verification = generateOpaqueToken();

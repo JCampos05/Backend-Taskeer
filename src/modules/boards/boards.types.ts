@@ -87,6 +87,6 @@ export interface MoveBoardsResultDto {
   tasksUnassigned: number;
   /** Subtareas en el mismo caso. */
   subtasksUnassigned: number;
-  /** Roles por tablero (overrides) de personas que no son miembros del destino. */
+  /** Roles por tablero (overrides) eliminados: se borran todos al mover, porque los concedió el admin del origen. */
   overridesRemoved: number;
 }

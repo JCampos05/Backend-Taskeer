@@ -25,6 +25,10 @@ export const env = {
   // que es una allowlist de seguridad, no "la URL canónica del frontend"
   // (puede tener 0, 1, o varios orígenes según el entorno).
   publicWebUrl: process.env.PUBLIC_WEB_URL ?? 'http://localhost:4200',
+  // Envío del correo de verificación de cuenta. Suspendido por ahora (sin
+  // dominio verificado en Resend): con 'false' no se manda ni se permite
+  // reenviar. Para reactivarlo: EMAIL_VERIFICATION_ENABLED=true.
+  emailVerificationEnabled: process.env.EMAIL_VERIFICATION_ENABLED === 'true',
   resendApiKey: process.env.RESEND_API_KEY ?? '',
   resendFromEmail: process.env.RESEND_FROM_EMAIL ?? '',
   internalWorkerSecret: required('INTERNAL_WORKER_SECRET'),

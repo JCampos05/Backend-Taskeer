@@ -12,7 +12,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "tsx scripts/with-database-url.ts migrate dev",
     "prisma:studio": "tsx scripts/with-database-url.ts studio",
-    "prisma:seed": "tsx prisma/seed.ts"
+    "prisma:seed": "tsx prisma/seed.ts",
+    "docs:api-check": "node scripts/check-api-docs.mjs"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
