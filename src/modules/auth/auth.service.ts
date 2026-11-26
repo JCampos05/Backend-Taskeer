@@ -16,6 +16,7 @@ import type {
   ResetPasswordWithCodeInput,
   UpdateProfileInput,
   VerifyEmailInput,
+  VerifyWithRecoveryCodeInput,
 } from './auth.schema';
 import type {
   GoogleLoginServiceResult,
@@ -41,6 +42,7 @@ function toPublicUser(user: {
   email: string;
   displayName: string;
   emailVerifiedAt: Date | null;
+  inviteVerifiedAt: Date | null;
   passwordHash: string | null;
 }): PublicUserDto {
   return {
@@ -48,6 +50,7 @@ function toPublicUser(user: {
     email: user.email,
     displayName: user.displayName,
     emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
+    inviteVerifiedAt: user.inviteVerifiedAt ? user.inviteVerifiedAt.toISOString() : null,
     hasPassword: user.passwordHash !== null,
   };
 }
@@ -276,6 +279,7 @@ async function issueSession(
     email: string;
     displayName: string;
     emailVerifiedAt: Date | null;
+    inviteVerifiedAt: Date | null;
     passwordHash: string | null;
   },
   context: { userAgent?: string; ipAddress?: string },
@@ -801,6 +805,72 @@ async function resetPasswordWithCode(
   pushNotification(notification);
 }
 
+/** Verifica la cuenta demostrando que se tiene uno de los códigos de
+ * recuperación PROPIOS. Sin Resend (suspendido, sin dominio) no hay forma de
+ * verificar por correo; esto confirma que la persona guardó los códigos que
+ * se mostraron al registrarse, NO que el correo sea suyo.
+ *
+ * Por eso escribe `inviteVerifiedAt` y NUNCA `emailVerifiedAt`: este último
+ * es la única barrera contra el secuestro de cuenta al vincular Google
+ * (loginWithGoogle) y exige prueba real de propiedad del correo.
+ *
+ * El código se valida pero NO se consume: sigue sirviendo para recuperar la
+ * contraseña. Solo se busca entre los códigos del propio usuario (userId de
+ * la sesión), nunca se acepta un código ajeno. Ya exige sesión activa. */
+async function verifyWithRecoveryCode(
+  userId: string,
+  input: VerifyWithRecoveryCodeInput,
+  context: { ipAddress?: string },
+): Promise<PublicUserDto> {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
+  }
+
+  if (user.emailVerifiedAt || user.inviteVerifiedAt) {
+    return toPublicUser(user);
+  }
+
+  const codeHash = createHash('sha256').update(input.code).digest('hex');
+  const recoveryCode = await prisma.recoveryCode.findUnique({ where: { codeHash } });
+
+  if (!recoveryCode || recoveryCode.userId !== user.id || recoveryCode.usedAt) {
+    // Los intentos fallidos dejan rastro: un patrón de fallos seguidos desde
+    // una sesión es la señal de alguien probando códigos.
+    await prisma.auditLog.create({
+      data: {
+        userId: user.id,
+        action: 'auth.invite_verification_failed',
+        ipAddress: context.ipAddress,
+      },
+    });
+    throw new AppError(400, 'INVALID_RECOVERY_CODE', 'El código de recuperación no es válido.');
+  }
+
+  // updateMany condicionado a inviteVerifiedAt null: dos peticiones simultáneas
+  // no pisan la fecha ni duplican el registro de auditoría.
+  const updated = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.user.updateMany({
+      where: { id: user.id, inviteVerifiedAt: null },
+      data: { inviteVerifiedAt: new Date() },
+    });
+
+    if (count > 0) {
+      await tx.auditLog.create({
+        data: {
+          userId: user.id,
+          action: 'auth.invite_verified_with_recovery_code',
+          ipAddress: context.ipAddress,
+        },
+      });
+    }
+
+    return tx.user.findUniqueOrThrow({ where: { id: user.id } });
+  });
+
+  return toPublicUser(updated);
+}
+
 async function regenerateRecoveryCodes(
   userId: string,
   input: RegenerateRecoveryCodesInput,
@@ -957,6 +1027,7 @@ export const authService = {
   loginWithGoogle,
   refreshAccessToken,
   resetPasswordWithCode,
+  verifyWithRecoveryCode,
   regenerateRecoveryCodes,
   changePassword,
   updateProfile,

@@ -54,6 +54,16 @@ export const resetPasswordWithCodeSchema = z.object({
   }),
 });
 
+export const verifyWithRecoveryCodeSchema = z.object({
+  body: z.object({
+    code: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(RECOVERY_CODE_PATTERN, 'El código de recuperación no tiene el formato correcto.'),
+  }),
+});
+
 export const regenerateRecoveryCodesSchema = z.object({
   body: z.object({
     currentPassword: z.string().min(1, 'La contraseña actual es obligatoria.'),
@@ -98,6 +108,7 @@ export type RegisterInput = z.infer<typeof registerSchema>['body'];
 export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>['query'];
 export type LoginInput = z.infer<typeof loginSchema>['body'];
 export type ResetPasswordWithCodeInput = z.infer<typeof resetPasswordWithCodeSchema>['body'];
+export type VerifyWithRecoveryCodeInput = z.infer<typeof verifyWithRecoveryCodeSchema>['body'];
 export type RegenerateRecoveryCodesInput = z.infer<typeof regenerateRecoveryCodesSchema>['body'];
 export type ChangePasswordInput = z.infer<typeof changePasswordSchema>['body'];
 export type UpdateProfileInput = z.infer<typeof updateProfileSchema>['body'];

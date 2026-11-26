@@ -36,6 +36,15 @@ export interface InvitationDto {
   invitedById: string;
   expiresAt: string;
   createdAt: string;
+  // Solo se llena en GET /workspaces/:id/invitations para las que están en
+  // AWAITING_APPROVAL: nombre de la cuenta que aceptó, para que quien aprueba
+  // pueda decidir si es la persona que esperaba. null en el resto.
+  inviteeDisplayName: string | null;
+  // Solo en la misma lista y para las mismas solicitudes: true si la cuenta
+  // que aceptó tiene el correo verificado de verdad (hoy, solo por Google).
+  // false = cualquiera pudo registrarse con ese correo, así que quien aprueba
+  // debe confirmar por otro medio que es la persona esperada. null en el resto.
+  inviteeEmailVerified: boolean | null;
 }
 
 // Invitación pendiente vista por quien la recibió (todavía no es miembro,
@@ -44,6 +53,10 @@ export interface InvitationDto {
 // segunda llamada).
 export interface MyInvitationDto extends InvitationDto {
   workspaceName: string;
+  // true si ya pasó expiresAt: se sigue listando unos días para poder decir
+  // "caducó, pide que te la vuelvan a enviar" en vez de que desaparezca sin
+  // explicación.
+  expired: boolean;
 }
 
 export interface AcceptInvitationResultDto {
@@ -52,4 +65,11 @@ export interface AcceptInvitationResultDto {
   // duplicó membresía, la invitación igual se marca ACCEPTED) — ver decisión
   // documentada en workspaces.service.ts, acceptInvitation().
   alreadyMember: boolean;
+  // true si aceptar NO te hizo miembro todavía: la solicitud quedó esperando
+  // que un OWNER/ADMIN la apruebe (ver InvitationStatus.AWAITING_APPROVAL).
+  awaitingApproval: boolean;
+}
+
+export interface InvitationDecisionResultDto {
+  invitation: InvitationDto;
 }

@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from 'node:crypto';
-import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
+import type { InvitationStatus, WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { entitlementsService } from '../billing/entitlements.service';
@@ -14,6 +14,7 @@ import type {
 } from './workspaces.schema';
 import type {
   AcceptInvitationResultDto,
+  InvitationDecisionResultDto,
   InvitationDto,
   MyInvitationDto,
   WorkspaceDto,
@@ -22,6 +23,17 @@ import type {
 } from './workspaces.types';
 
 const INVITATION_TTL_MS = 72 * 60 * 60 * 1000; // 72h
+// Plazo para que un OWNER/ADMIN apruebe una invitación ya aceptada. Pasado
+// esto la solicitud caduca y hay que volver a invitar.
+const APPROVAL_TTL_MS = 48 * 60 * 60 * 1000; // 48h
+// Mínimo entre dos invitaciones al mismo correo en el mismo workspace: frena
+// el reenvío en ráfaga (spam hacia una dirección) sin impedir reintentar.
+const INVITATION_RESEND_COOLDOWN_MS = 5 * 60 * 1000; // 5 min
+// Cuánto tiempo se sigue mostrando al invitado una invitación caducada, para
+// poder decirle que pida que se la reenvíen.
+const EXPIRED_INVITATION_VISIBLE_MS = 7 * 24 * 60 * 60 * 1000; // 7 días
+// Solicitudes esperando aprobación a la vez en un mismo workspace.
+const MAX_AWAITING_APPROVALS_PER_WORKSPACE = 20;
 
 // Roles con los mismos permisos que OWNER excepto transferir/borrar el
 // workspace — ver docs/02-modelo-datos.md, sección WorkspaceMember.
@@ -54,7 +66,7 @@ function toInvitationDto(invitation: {
   invitedById: string;
   expiresAt: Date;
   createdAt: Date;
-}): InvitationDto {
+}, inviteeDisplayName: string | null = null, inviteeEmailVerified: boolean | null = null): InvitationDto {
   return {
     id: invitation.id,
     workspaceId: invitation.workspaceId,
@@ -64,6 +76,8 @@ function toInvitationDto(invitation: {
     invitedById: invitation.invitedById,
     expiresAt: invitation.expiresAt.toISOString(),
     createdAt: invitation.createdAt.toISOString(),
+    inviteeDisplayName,
+    inviteeEmailVerified,
   };
 }
 
@@ -492,14 +506,50 @@ async function createInvitation(
     throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
   }
 
-  // Solo se puede invitar si el propio invitador ya verificó su correo (ver
-  // docs/07-alcance-mvp.md, sección "Colaboración e invitaciones").
-  if (!actingUser.emailVerifiedAt) {
+  // Solo se puede invitar si el propio invitador verificó su correo o, sin
+  // correo transaccional disponible, demostró tener un código de recuperación
+  // (inviteVerifiedAt) — ver docs/07-alcance-mvp.md, "Colaboración e invitaciones".
+  if (!actingUser.emailVerifiedAt && !actingUser.inviteVerifiedAt) {
     throw new AppError(
       403,
       'EMAIL_NOT_VERIFIED',
       'Debes verificar tu correo antes de invitar a alguien a este workspace.',
     );
+  }
+
+  // Una solicitud ya aceptada y esperando aprobación no se pisa con una
+  // invitación nueva: primero hay que aprobarla o rechazarla.
+  const awaiting = await prisma.invitation.findFirst({
+    where: {
+      workspaceId,
+      email: input.email,
+      status: 'AWAITING_APPROVAL',
+      expiresAt: { gt: new Date() },
+    },
+  });
+  if (awaiting) {
+    throw new AppError(
+      409,
+      'INVITATION_AWAITING_APPROVAL',
+      'Esa persona ya aceptó la invitación y está esperando aprobación. Apruébala o recházala.',
+    );
+  }
+
+  // Tiempo mínimo entre invitaciones al mismo correo. Una invitación REVOKED
+  // no cuenta: revocar y corregir (ej. otro rol) es una acción deliberada.
+  const lastInvitation = await prisma.invitation.findFirst({
+    where: { workspaceId, email: input.email, status: { not: 'REVOKED' } },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (lastInvitation) {
+    const waitMs = lastInvitation.createdAt.getTime() + INVITATION_RESEND_COOLDOWN_MS - Date.now();
+    if (waitMs > 0) {
+      throw new AppError(
+        429,
+        'INVITATION_COOLDOWN',
+        `Ya enviaste una invitación a este correo hace poco. Espera ${Math.ceil(waitMs / 60000)} min para volver a enviarla.`,
+      );
+    }
   }
 
   const invitationToken = generateOpaqueToken();
@@ -586,7 +636,27 @@ async function listInvitations(workspaceId: string, actingUserId: string): Promi
     orderBy: { createdAt: 'desc' },
   });
 
-  return invitations.map(toInvitationDto);
+  // Para las solicitudes esperando aprobación, el nombre de la cuenta que
+  // aceptó (el correo es único, así que es exactamente esa cuenta).
+  const awaitingEmails = invitations
+    .filter((invitation) => invitation.status === 'AWAITING_APPROVAL')
+    .map((invitation) => invitation.email);
+  const invitees = awaitingEmails.length
+    ? await prisma.user.findMany({
+        where: { email: { in: awaitingEmails } },
+        select: { email: true, displayName: true, emailVerifiedAt: true },
+      })
+    : [];
+  const inviteeByEmail = new Map(invitees.map((user) => [user.email, user]));
+
+  return invitations.map((invitation) => {
+    const invitee = inviteeByEmail.get(invitation.email);
+    return toInvitationDto(
+      invitation,
+      invitee?.displayName ?? null,
+      invitee ? invitee.emailVerifiedAt !== null : null,
+    );
+  });
 }
 
 async function revokeInvitation(
@@ -605,81 +675,307 @@ async function revokeInvitation(
     throw new AppError(404, 'INVITATION_NOT_FOUND', 'Esa invitación no existe o ya no está pendiente.');
   }
 
-  await prisma.$transaction([
-    prisma.invitation.update({
-      where: { id: invitation.id },
+  await prisma.$transaction(async (tx) => {
+    // Condicionado a PENDING: si el invitado aceptó mientras tanto (pasó a
+    // AWAITING_APPROVAL) no se pisa ese estado; la solicitud se decide con
+    // aprobar/rechazar.
+    const { count } = await tx.invitation.updateMany({
+      where: { id: invitation.id, status: 'PENDING' },
       data: { status: 'REVOKED' },
-    }),
-    prisma.auditLog.create({
+    });
+    if (count === 0) {
+      throw new AppError(
+        404,
+        'INVITATION_NOT_FOUND',
+        'Esa invitación no existe o ya no está pendiente.',
+      );
+    }
+
+    await tx.auditLog.create({
       data: {
         userId: actingUserId,
         action: 'workspace.invitation_revoked',
         metadata: { workspaceId, invitationId: invitation.id, email: invitation.email },
       },
-    }),
-  ]);
+    });
+  });
 }
 
-/** Crea el WorkspaceMember (o no, si ya lo era) y marca la invitación
- * ACCEPTED — compartido entre aceptar por token (link de correo) y aceptar
- * por id (bandeja de invitaciones dentro de la app, ver acceptInvitationById). */
-async function finalizeInvitationAcceptance(
-  invitation: { id: string; workspaceId: string; role: WorkspaceRole },
-  workspace: {
-    id: string;
-    name: string;
-    slug: string;
-    ownerId: string;
-    createdAt: Date;
-    updatedAt: Date;
-  },
-  userId: string,
-): Promise<AcceptInvitationResultDto> {
-  // Intenta crear la membresía directo, sin chequear antes si ya existe —
-  // un chequeo previo (`getMembership`) fuera de esta transacción deja una
-  // ventana de carrera: dos aceptaciones casi simultáneas de la misma
-  // invitación (posible ahora que hay dos caminos de entrada — el link de
-  // correo y la bandeja dentro de la app — que alguien podría disparar casi
-  // a la vez) podían pasar ambas el chequeo "todavía no soy miembro" y
-  // ambas intentar crear la fila. La restricción `@@unique([workspaceId,
-  // userId])` de WorkspaceMember ya lo impide a nivel de base de datos —
-  // acá simplemente se captura esa violación (P2002) y se trata como
-  // "ya era miembro" en vez de dejar que explote en un 500 genérico.
-  try {
-    await prisma.$transaction([
-      prisma.workspaceMember.create({
-        data: { workspaceId: invitation.workspaceId, userId, role: invitation.role },
-      }),
-      prisma.invitation.update({
-        where: { id: invitation.id },
-        data: { status: 'ACCEPTED' },
-      }),
-      prisma.auditLog.create({
-        data: {
-          userId,
-          action: 'workspace.invitation_accepted',
-          metadata: { workspaceId: invitation.workspaceId, invitationId: invitation.id },
-        },
-      }),
-    ]);
+type WorkspaceRow = {
+  id: string;
+  name: string;
+  slug: string;
+  ownerId: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
 
-    return { workspace: toWorkspaceDto(workspace), alreadyMember: false };
-  } catch (err) {
-    if (!isUniqueConstraintError(err)) {
-      throw err;
-    }
+/** Aceptar una invitación (por token o por id) YA NO crea la membresía: deja
+ * la invitación en AWAITING_APPROVAL y avisa a los OWNER/ADMIN del workspace,
+ * que deben confirmar que quien aceptó es la persona esperada. Sin este paso,
+ * cualquiera podía registrarse con el correo invitado antes que el invitado
+ * real y entrar al workspace (el correo no se puede verificar sin correo
+ * transaccional).
+ *
+ * Excepción: si el usuario ya era miembro no hay nada que aprobar — se marca
+ * la invitación ACCEPTED sin duplicar la fila ni cambiar su rol. Es idempotente:
+ * aceptar de nuevo una solicitud ya en espera no vuelve a notificar. */
+async function requestInvitationApproval(
+  invitation: {
+    id: string;
+    workspaceId: string;
+    email: string;
+    role: WorkspaceRole;
+    status: InvitationStatus;
+  },
+  workspace: WorkspaceRow,
+  user: { id: string; displayName: string; emailVerifiedAt: Date | null },
+): Promise<AcceptInvitationResultDto> {
+  const workspaceDto = toWorkspaceDto(workspace);
+
+  const existingMember = await prisma.workspaceMember.findFirst({
+    where: { workspaceId: invitation.workspaceId, userId: user.id },
+  });
+  if (existingMember) {
+    await prisma.invitation.updateMany({
+      where: { id: invitation.id, status: { in: ['PENDING', 'AWAITING_APPROVAL'] } },
+      data: { status: 'ACCEPTED' },
+    });
+    return { workspace: workspaceDto, alreadyMember: true, awaitingApproval: false };
   }
 
-  // Ya era miembro (aceptó antes, ya lo habían agregado por otra vía, o
-  // perdió la carrera descrita arriba) — no se duplica la fila ni se
-  // cambia su rol actual, solo se marca la invitación como ACCEPTED (ya
-  // cumplió su propósito) si todavía no lo estaba.
-  await prisma.invitation.updateMany({
-    where: { id: invitation.id, status: 'PENDING' },
-    data: { status: 'ACCEPTED' },
+  if (invitation.status === 'AWAITING_APPROVAL') {
+    return { workspace: workspaceDto, alreadyMember: false, awaitingApproval: true };
+  }
+
+  // Tope de solicitudes esperando aprobación por workspace: sin él, una
+  // cuenta con permiso de invitar podría inundar de notificaciones a todos
+  // los OWNER/ADMIN invitando a muchos correos que aceptan al instante.
+  const awaitingCount = await prisma.invitation.count({
+    where: {
+      workspaceId: invitation.workspaceId,
+      status: 'AWAITING_APPROVAL',
+      expiresAt: { gt: new Date() },
+    },
+  });
+  if (awaitingCount >= MAX_AWAITING_APPROVALS_PER_WORKSPACE) {
+    throw new AppError(
+      429,
+      'TOO_MANY_PENDING_APPROVALS',
+      'Este workspace tiene demasiadas solicitudes esperando aprobación. Intenta de nuevo más tarde.',
+    );
+  }
+
+  // Aviso explícito cuando la cuenta no tiene el correo verificado: cualquiera
+  // pudo registrarse con ese correo, y el nombre lo elige quien se registra.
+  const unverifiedNote = user.emailVerifiedAt
+    ? ''
+    : ' Ojo: su cuenta no tiene el correo verificado, confirma por otro medio que es esa persona.';
+
+  // updateMany condicionado a PENDING: dos aceptaciones simultáneas solo
+  // notifican una vez.
+  const notifications = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.invitation.updateMany({
+      where: { id: invitation.id, status: 'PENDING' },
+      data: {
+        status: 'AWAITING_APPROVAL',
+        expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
+      },
+    });
+    if (count === 0) {
+      return [];
+    }
+
+    const approvers = await tx.workspaceMember.findMany({
+      where: { workspaceId: invitation.workspaceId, role: { in: OWNER_LIKE_ROLES } },
+      select: { userId: true },
+    });
+
+    const created = [];
+    for (const approver of approvers) {
+      created.push(
+        await tx.notification.create({
+          data: {
+            userId: approver.userId,
+            type: 'INVITATION_REQUEST',
+            title: 'Solicitud para unirse a un workspace',
+            body: `${user.displayName} (${invitation.email}) aceptó la invitación a "${workspace.name}" como ${invitation.role}. Confirma que es quien esperabas.${unverifiedNote}`,
+          },
+        }),
+      );
+    }
+
+    await tx.auditLog.create({
+      data: {
+        userId: user.id,
+        action: 'workspace.invitation_approval_requested',
+        metadata: { workspaceId: invitation.workspaceId, invitationId: invitation.id },
+      },
+    });
+
+    return created;
   });
 
-  return { workspace: toWorkspaceDto(workspace), alreadyMember: true };
+  // Fuera de la transacción: un fallo del push en vivo no debe revertir la
+  // solicitud ya registrada (la fila en Notification es la fuente de verdad).
+  for (const notification of notifications) {
+    pushNotification(notification);
+  }
+
+  return { workspace: workspaceDto, alreadyMember: false, awaitingApproval: true };
+}
+
+/** OWNER/ADMIN aprueba una solicitud: recién ahora se crea la membresía, con
+ * el rol de la invitación. La cuenta que se une es la que tiene el correo de
+ * la invitación (único en User, y aceptar exigió coincidir con él). */
+async function approveInvitation(
+  workspaceId: string,
+  actingUserId: string,
+  invitationId: string,
+): Promise<InvitationDecisionResultDto> {
+  const { workspace, membership } = await requireMembership(workspaceId, actingUserId);
+  requireOwnerOrAdmin(membership);
+
+  const notFoundError = new AppError(
+    404,
+    'INVITATION_NOT_FOUND',
+    'Esa solicitud no existe o ya no está esperando aprobación.',
+  );
+
+  const invitation = await prisma.invitation.findFirst({
+    where: { id: invitationId, workspaceId },
+  });
+  if (!invitation || invitation.status !== 'AWAITING_APPROVAL') {
+    throw notFoundError;
+  }
+  if (invitation.expiresAt < new Date()) {
+    throw new AppError(
+      410,
+      'INVITATION_EXPIRED',
+      'La solicitud caducó. Vuelve a invitar a esa persona.',
+    );
+  }
+
+  const invitee = await prisma.user.findUnique({ where: { email: invitation.email } });
+  if (!invitee) {
+    throw notFoundError;
+  }
+
+  const notification = await prisma.$transaction(async (tx) => {
+    // Reclama la solicitud de forma atómica: si otro OWNER/ADMIN la decidió
+    // mientras tanto, count es 0 y se aborta sin crear nada.
+    const { count } = await tx.invitation.updateMany({
+      where: { id: invitation.id, status: 'AWAITING_APPROVAL', expiresAt: { gt: new Date() } },
+      data: { status: 'ACCEPTED' },
+    });
+    if (count === 0) {
+      throw notFoundError;
+    }
+
+    // skipDuplicates: si por otra vía ya era miembro no se duplica ni se
+    // cambia su rol, y la transacción no se aborta por la restricción única.
+    await tx.workspaceMember.createMany({
+      data: [{ workspaceId, userId: invitee.id, role: invitation.role }],
+      skipDuplicates: true,
+    });
+
+    await tx.auditLog.create({
+      data: {
+        userId: actingUserId,
+        action: 'workspace.invitation_approved',
+        metadata: {
+          workspaceId,
+          invitationId: invitation.id,
+          inviteeId: invitee.id,
+          role: invitation.role,
+        },
+      },
+    });
+
+    return tx.notification.create({
+      data: {
+        userId: invitee.id,
+        type: 'INVITATION_DECISION',
+        title: 'Te aprobaron en un workspace',
+        body: `Ya eres parte de "${workspace.name}".`,
+      },
+    });
+  });
+
+  pushNotification(notification);
+
+  return {
+    invitation: toInvitationDto({ ...invitation, status: 'ACCEPTED' }, invitee.displayName),
+  };
+}
+
+/** OWNER/ADMIN rechaza una solicitud: la invitación queda REVOKED y quien
+ * aceptó no entra. */
+async function rejectInvitation(
+  workspaceId: string,
+  actingUserId: string,
+  invitationId: string,
+): Promise<InvitationDecisionResultDto> {
+  const { workspace, membership } = await requireMembership(workspaceId, actingUserId);
+  requireOwnerOrAdmin(membership);
+
+  const notFoundError = new AppError(
+    404,
+    'INVITATION_NOT_FOUND',
+    'Esa solicitud no existe o ya no está esperando aprobación.',
+  );
+
+  const invitation = await prisma.invitation.findFirst({
+    where: { id: invitationId, workspaceId },
+  });
+  if (!invitation || invitation.status !== 'AWAITING_APPROVAL') {
+    throw notFoundError;
+  }
+
+  const invitee = await prisma.user.findUnique({ where: { email: invitation.email } });
+
+  const notification = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.invitation.updateMany({
+      where: { id: invitation.id, status: 'AWAITING_APPROVAL' },
+      data: { status: 'REVOKED' },
+    });
+    if (count === 0) {
+      throw notFoundError;
+    }
+
+    await tx.auditLog.create({
+      data: {
+        userId: actingUserId,
+        action: 'workspace.invitation_rejected',
+        metadata: {
+          workspaceId,
+          invitationId: invitation.id,
+          inviteeId: invitee?.id ?? null,
+        },
+      },
+    });
+
+    if (!invitee) {
+      return null;
+    }
+
+    return tx.notification.create({
+      data: {
+        userId: invitee.id,
+        type: 'INVITATION_DECISION',
+        title: 'Rechazaron tu solicitud',
+        body: `No se aprobó tu ingreso a "${workspace.name}".`,
+      },
+    });
+  });
+
+  if (notification) {
+    pushNotification(notification);
+  }
+
+  return {
+    invitation: toInvitationDto({ ...invitation, status: 'REVOKED' }, invitee?.displayName ?? null),
+  };
 }
 
 async function acceptInvitation(
@@ -701,7 +997,7 @@ async function acceptInvitation(
 
   if (
     !invitation ||
-    invitation.status !== 'PENDING' ||
+    (invitation.status !== 'PENDING' && invitation.status !== 'AWAITING_APPROVAL') ||
     invitation.expiresAt < new Date() ||
     invitation.workspace.deletedAt !== null
   ) {
@@ -719,7 +1015,15 @@ async function acceptInvitation(
     throw invalidError;
   }
 
-  return finalizeInvitationAcceptance(invitation, invitation.workspace, userId);
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, displayName: true, emailVerifiedAt: true },
+  });
+  if (!user) {
+    throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
+  }
+
+  return requestInvitationApproval(invitation, invitation.workspace, user);
 }
 
 /** Invitaciones PENDING dirigidas al correo del usuario autenticado — la
@@ -729,15 +1033,28 @@ async function acceptInvitation(
  * docs/01-arquitectura.md). El invitado ya puede ver y aceptar desde acá
  * aunque el email nunca le haya llegado. */
 async function listMyInvitations(userEmail: string): Promise<MyInvitationDto[]> {
+  const now = new Date();
+  // También las caducadas de los últimos días (con `expired: true`): así el
+  // invitado ve "caducó, pide que te la vuelvan a enviar" en vez de que la
+  // invitación desaparezca sin explicación. Las AWAITING_APPROVAL se listan
+  // para que vea que su solicitud está en espera.
   const invitations = await prisma.invitation.findMany({
-    where: { email: userEmail, status: 'PENDING', expiresAt: { gt: new Date() } },
+    where: {
+      email: userEmail,
+      status: { in: ['PENDING', 'AWAITING_APPROVAL'] },
+      expiresAt: { gt: new Date(now.getTime() - EXPIRED_INVITATION_VISIBLE_MS) },
+    },
     include: { workspace: true },
     orderBy: { createdAt: 'desc' },
   });
 
   return invitations
     .filter((invitation) => invitation.workspace.deletedAt === null)
-    .map((invitation) => ({ ...toInvitationDto(invitation), workspaceName: invitation.workspace.name }));
+    .map((invitation) => ({
+      ...toInvitationDto(invitation),
+      workspaceName: invitation.workspace.name,
+      expired: invitation.expiresAt < now,
+    }));
 }
 
 /** Igual que acceptInvitation, pero identificando la invitación por id en
@@ -763,22 +1080,36 @@ async function acceptInvitationById(
     include: { workspace: true },
   });
 
+  // Mismo criterio que acceptInvitation: nunca dejar que una cuenta acepte
+  // una invitación dirigida a otro correo, aunque conozca el id. Se comprueba
+  // ANTES de distinguir "caducó", para que ese aviso específico solo lo vea
+  // el dueño del correo y no filtre nada a terceros.
   if (
     !invitation ||
-    invitation.status !== 'PENDING' ||
-    invitation.expiresAt < new Date() ||
-    invitation.workspace.deletedAt !== null
+    invitation.workspace.deletedAt !== null ||
+    invitation.email !== userEmail ||
+    (invitation.status !== 'PENDING' && invitation.status !== 'AWAITING_APPROVAL')
   ) {
     throw notFoundError;
   }
 
-  // Mismo criterio que acceptInvitation: nunca dejar que una cuenta acepte
-  // una invitación dirigida a otro correo, aunque conozca el id.
-  if (invitation.email !== userEmail) {
-    throw notFoundError;
+  if (invitation.expiresAt < new Date()) {
+    throw new AppError(
+      410,
+      'INVITATION_EXPIRED',
+      'La invitación caducó. Pide que te la vuelvan a enviar.',
+    );
   }
 
-  return finalizeInvitationAcceptance(invitation, invitation.workspace, userId);
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, displayName: true, emailVerifiedAt: true },
+  });
+  if (!user) {
+    throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
+  }
+
+  return requestInvitationApproval(invitation, invitation.workspace, user);
 }
 
 export const workspacesService = {
@@ -794,6 +1125,8 @@ export const workspacesService = {
   createInvitation,
   listInvitations,
   revokeInvitation,
+  approveInvitation,
+  rejectInvitation,
   acceptInvitation,
   listMyInvitations,
   acceptInvitationById,

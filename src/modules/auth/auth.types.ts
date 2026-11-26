@@ -6,6 +6,9 @@ export interface PublicUserDto {
   email: string;
   displayName: string;
   emailVerifiedAt: string | null;
+  // Verificada con un código de recuperación: habilita invitar, pero NO
+  // equivale a correo verificado (no cuenta para vincular Google).
+  inviteVerifiedAt: string | null;
   // false para cuentas creadas por Google que nunca agregaron una
   // contraseña local (User.passwordHash null) — el Frontend lo usa para
   // decidir si mostrar "cambiar contraseña"/"regenerar códigos de

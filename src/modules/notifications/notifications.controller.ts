@@ -5,6 +5,7 @@ import { consumeStreamTicket, issueStreamTicket, openStream } from './notificati
 import type {
   ListNotificationsQuery,
   NotificationIdParams,
+  SnoozeNotificationInput,
   StreamQuery,
 } from './notifications.schema';
 
@@ -26,6 +27,20 @@ async function markAsRead(req: Request, res: Response, next: NextFunction) {
     const { notificationId } = req.params as unknown as NotificationIdParams;
     const notification = await notificationsService.markAsRead(notificationId, req.auth!.sub);
     res.status(200).json({ notification });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function snooze(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { notificationId } = req.params as unknown as NotificationIdParams;
+    const result = await notificationsService.snoozeNotification(
+      notificationId,
+      req.auth!.sub,
+      req.body as SnoozeNotificationInput,
+    );
+    res.status(201).json(result);
   } catch (err) {
     next(err);
   }
@@ -89,6 +104,7 @@ function stream(req: Request, res: Response, next: NextFunction) {
 export const notificationsController = {
   list,
   markAsRead,
+  snooze,
   markAllAsRead,
   remove,
   removeRead,

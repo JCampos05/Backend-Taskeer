@@ -69,6 +69,11 @@ model UserPreferences {
 
 enum InvitationStatus {
   PENDING
+  // El invitado ya aceptó, pero todavía no es miembro: un OWNER/ADMIN del
+  // workspace debe confirmar que la persona que aceptó es quien se esperaba
+  // (cierra el caso de alguien que se registra con el correo invitado antes
+  // que el invitado real). `expiresAt` pasa a ser el plazo de esa aprobación.
+  AWAITING_APPROVAL
   ACCEPTED
   EXPIRED
   REVOKED
@@ -108,34 +113,42 @@ model Timezone {
 }
 
 model User {
-  id              String    @id @default(uuid()) @db.Char(36)
-  email           String    @unique @db.VarChar(255)
+  id               String    @id @default(uuid()) @db.Char(36)
+  email            String    @unique @db.VarChar(255)
   // Opcional a propósito: una cuenta que solo entra por Google (OAuthIdentity)
   // nunca tiene contraseña propia. Si es null, el login local por
   // email+contraseña debe rechazarse explícitamente, no fallar por un hash
   // vacío comparado a ciegas.
-  passwordHash    String?   @db.VarChar(255)
-  displayName     String    @db.VarChar(100)
-  emailVerifiedAt DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  passwordHash     String?   @db.VarChar(255)
+  displayName      String    @db.VarChar(100)
+  emailVerifiedAt  DateTime?
+  // Cuenta "confiable para invitar": demostró tener uno de sus códigos de
+  // recuperación (POST /auth/verify-with-recovery-code). NO prueba que el
+  // correo sea suyo, por eso es un campo APARTE de emailVerifiedAt: este
+  // último es la única barrera contra el secuestro de cuenta al vincular
+  // Google (auth.service.ts, loginWithGoogle) y solo lo pone una prueba real
+  // de propiedad del correo (enlace o Google). inviteVerifiedAt solo habilita
+  // invitar a workspaces; nunca debe usarse para vincular identidades.
+  inviteVerifiedAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
-  memberships       WorkspaceMember[]
-  assignedTasks     Task[]             @relation("TaskAssignee")
-  assignedSubtasks  Subtask[]          @relation("SubtaskAssignee")
+  memberships        WorkspaceMember[]
+  assignedTasks      Task[]                @relation("TaskAssignee")
+  assignedSubtasks   Subtask[]             @relation("SubtaskAssignee")
   boardRoleOverrides BoardMemberOverride[]
-  pushSubscriptions PushSubscription[]
-  auditLogs         AuditLog[]
-  authTokens        AuthToken[]
-  recoveryCodes     RecoveryCode[]
-  refreshTokens     RefreshToken[]
-  sentInvitations   Invitation[]       @relation("InvitationsSent")
-  notifications     Notification[]
-  preferences       UserPreferences?
-  subscription      Subscription?
-  oauthIdentities   OAuthIdentity[]
-  attachments       Attachment[]
-  myDayTasks        MyDayTask[]
+  pushSubscriptions  PushSubscription[]
+  auditLogs          AuditLog[]
+  authTokens         AuthToken[]
+  recoveryCodes      RecoveryCode[]
+  refreshTokens      RefreshToken[]
+  sentInvitations    Invitation[]          @relation("InvitationsSent")
+  notifications      Notification[]
+  preferences        UserPreferences?
+  subscription       Subscription?
+  oauthIdentities    OAuthIdentity[]
+  attachments        Attachment[]
+  myDayTasks         MyDayTask[]
 
   @@map("users")
 }
@@ -149,13 +162,13 @@ enum OAuthProvider {
 // se agrega otro proveedor (Apple, GitHub, etc.) — agregar uno nuevo es una
 // fila más en este enum, no una columna nueva en User.
 model OAuthIdentity {
-  id       String        @id @default(uuid()) @db.Char(36)
-  userId   String        @db.Char(36)
-  provider OAuthProvider
+  id             String        @id @default(uuid()) @db.Char(36)
+  userId         String        @db.Char(36)
+  provider       OAuthProvider
   // El "sub" que entrega el proveedor (vía Supabase Auth) — estable aunque el
   // usuario cambie su email en Google, a diferencia de guardar el email como
   // identificador.
-  providerUserId String  @db.VarChar(255)
+  providerUserId String        @db.VarChar(255)
 
   createdAt DateTime @default(now())
 
@@ -180,6 +193,11 @@ enum NotificationType {
   // Alguien te asignó una tarea a ti (nunca se dispara si te la asignas a
   // ti mismo — ver tasks.service.ts, createTask/updateTask).
   TASK_ASSIGNED
+  // Alguien aceptó una invitación y espera que un OWNER/ADMIN la apruebe —
+  // va a todos los OWNER/ADMIN del workspace.
+  INVITATION_REQUEST
+  // Resultado de esa aprobación (aprobada o rechazada) — va a quien aceptó.
+  INVITATION_DECISION
 }
 
 model Notification {
@@ -202,15 +220,15 @@ model Notification {
 }
 
 model RefreshToken {
-  id         String    @id @default(uuid()) @db.Char(36)
-  userId     String    @db.Char(36)
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @db.Char(36)
   // Igual que AuthToken: se guarda el hash, nunca el token en texto plano.
-  tokenHash  String    @unique @db.Char(64)
-  userAgent  String?   @db.VarChar(255)
-  ipAddress  String?   @db.VarChar(45)
-  expiresAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
+  tokenHash String    @unique @db.Char(64)
+  userAgent String?   @db.VarChar(255)
+  ipAddress String?   @db.VarChar(45)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -248,11 +266,11 @@ model AuthToken {
 // Ver "Recuperación de contraseña" en docs/03-autenticacion-seguridad.md para
 // el flujo completo (generación, consumo, regeneración, notificación de uso).
 model RecoveryCode {
-  id     String @id @default(uuid()) @db.Char(36)
-  userId String @db.Char(36)
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @db.Char(36)
   // Igual que el resto de tokens: solo se guarda el hash, nunca el código en
   // texto plano. El código en sí solo existe en pantalla una vez, al generarse.
-  codeHash String @unique @db.Char(64)
+  codeHash  String    @unique @db.Char(64)
   // null = no usado todavía. Nunca se borra la fila al usarse — se marca, para
   // poder auditar cuál de los 10 códigos se consumió y cuándo.
   usedAt    DateTime?
@@ -323,17 +341,17 @@ model Workspace {
 }
 
 model Invitation {
-  id          String            @id @default(uuid()) @db.Char(36)
-  workspaceId String            @db.Char(36)
+  id          String           @id @default(uuid()) @db.Char(36)
+  workspaceId String           @db.Char(36)
   // El invitado puede no tener cuenta todavía — se invita por correo, no por userId.
-  email       String            @db.VarChar(255)
-  role        WorkspaceRole     @default(EDITOR)
+  email       String           @db.VarChar(255)
+  role        WorkspaceRole    @default(EDITOR)
   // Mismo patrón que AuthToken: solo se guarda el hash del token de la invitación.
-  tokenHash   String            @unique @db.Char(64)
-  invitedById String            @db.Char(36)
-  status      InvitationStatus  @default(PENDING)
+  tokenHash   String           @unique @db.Char(64)
+  invitedById String           @db.Char(36)
+  status      InvitationStatus @default(PENDING)
   expiresAt   DateTime
-  createdAt   DateTime          @default(now())
+  createdAt   DateTime         @default(now())
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   invitedBy User      @relation("InvitationsSent", fields: [invitedById], references: [id], onDelete: Cascade)
@@ -371,8 +389,8 @@ model Board {
   updatedAt   DateTime  @updatedAt
   deletedAt   DateTime?
 
-  workspace      Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  columns        Column[]
+  workspace       Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  columns         Column[]
   memberOverrides BoardMemberOverride[]
 
   // El slug es único dentro de su workspace, no globalmente — permite URLs
@@ -412,14 +430,14 @@ model BoardMemberOverride {
 }
 
 model Column {
-  id        String   @id @default(uuid()) @db.Char(36)
-  boardId   String   @db.Char(36)
-  name      String   @db.VarChar(100)
-  position  Int
+  id           String   @id @default(uuid()) @db.Char(36)
+  boardId      String   @db.Char(36)
+  name         String   @db.VarChar(100)
+  position     Int
   // Límite de tareas simultáneas (no borradas) en esta columna — null =
   // ilimitado. Configurable por OWNER/ADMIN del workspace, igual que el
   // resto de columna/board (docs/07-alcance-mvp.md, "Kanban").
-  wipLimit  Int?
+  wipLimit     Int?
   // Marca estructural de "esta columna representa tarea terminada" — antes
   // de este campo no existía NINGUNA señal de completitud en el modelo de
   // datos, solo la convención de nombre "Hecho" que siembra el seed
@@ -431,9 +449,9 @@ model Column {
   // igual que wipLimit. Nombre con prefijo is+Column (no solo "isDone") a
   // propósito: distingue "esta es la columna de terminadas" de un futuro
   // Task.isDone que signifique otra cosa ("esta tarea puntual ya se hizo").
-  isDoneColumn Boolean @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  isDoneColumn Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
   tasks Task[]
@@ -464,10 +482,10 @@ model Task {
   updatedAt   DateTime     @updatedAt
   deletedAt   DateTime?
 
-  column    Column     @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  column        Column         @relation(fields: [columnId], references: [id], onDelete: Cascade)
   // Si se borra el usuario asignado, la tarea sobrevive sin asignar en vez de
   // desaparecer o bloquear el borrado del usuario.
-  assignee  User?      @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  assignee      User?          @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
   reminders     Reminder[]
   notifications Notification[]
   attachments   Attachment[]
@@ -619,9 +637,9 @@ model Plan {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  entitlements         PlanEntitlement[]
-  subscriptionsCurrent  Subscription[] @relation("CurrentPlan")
-  subscriptionsPrevious Subscription[] @relation("PreviousPlan")
+  entitlements          PlanEntitlement[]
+  subscriptionsCurrent  Subscription[]    @relation("CurrentPlan")
+  subscriptionsPrevious Subscription[]    @relation("PreviousPlan")
 
   @@map("plans")
 }
@@ -668,11 +686,11 @@ model Subscription {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   // Restrict, no Cascade: no debe poder borrarse un Plan que todavía tiene
   // suscripciones activas apuntándole — hay que migrar a esos usuarios primero.
-  plan         Plan    @relation("CurrentPlan", fields: [planId], references: [id], onDelete: Restrict)
-  previousPlan Plan?   @relation("PreviousPlan", fields: [previousPlanId], references: [id], onDelete: SetNull)
+  plan         Plan  @relation("CurrentPlan", fields: [planId], references: [id], onDelete: Restrict)
+  previousPlan Plan? @relation("PreviousPlan", fields: [previousPlanId], references: [id], onDelete: SetNull)
 
   overrides SubscriptionEntitlementOverride[]
 

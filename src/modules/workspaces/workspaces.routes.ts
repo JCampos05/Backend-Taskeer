@@ -8,6 +8,7 @@ import {
   acceptInvitationSchema,
   createInvitationSchema,
   createWorkspaceSchema,
+  decideInvitationSchema,
   listInvitationsSchema,
   memberParamsSchema,
   revokeInvitationSchema,
@@ -118,6 +119,22 @@ workspacesRouter.delete(
   requireAuth,
   validate(revokeInvitationSchema),
   workspacesController.revokeInvitation,
+);
+
+// Solicitudes: invitaciones ya aceptadas que esperan que un OWNER/ADMIN confirme
+// que quien aceptó es la persona esperada (el permiso se verifica en el service).
+workspacesRouter.post(
+  '/workspaces/:id/invitations/:invitationId/approve',
+  requireAuth,
+  validate(decideInvitationSchema),
+  workspacesController.approveInvitation,
+);
+
+workspacesRouter.post(
+  '/workspaces/:id/invitations/:invitationId/reject',
+  requireAuth,
+  validate(decideInvitationSchema),
+  workspacesController.rejectInvitation,
 );
 
 // Nivel raíz del módulo (no anidada bajo /workspaces/:id) porque quien acepta

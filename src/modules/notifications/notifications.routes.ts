@@ -6,6 +6,7 @@ import { notificationsController } from './notifications.controller';
 import {
   listNotificationsSchema,
   notificationIdParamSchema,
+  snoozeNotificationSchema,
   streamSchema,
 } from './notifications.schema';
 
@@ -33,6 +34,29 @@ notificationsRouter.patch(
   requireAuth,
   validate(notificationIdParamSchema),
   notificationsController.markAsRead,
+);
+
+// Limiter propio: cada snooze crea un Reminder, así que no debe depender solo
+// del límite global compartido con el resto de rutas.
+const snoozeRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: {
+      code: 'TOO_MANY_REQUESTS',
+      message: 'Demasiados intentos. Intenta de nuevo más tarde.',
+    },
+  },
+});
+
+notificationsRouter.post(
+  '/notifications/:notificationId/snooze',
+  requireAuth,
+  snoozeRateLimit,
+  validate(snoozeNotificationSchema),
+  notificationsController.snooze,
 );
 
 // Ruta literal '/read' antes que la paramétrica '/:notificationId' — si no,

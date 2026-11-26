@@ -5,6 +5,7 @@ import type {
   AcceptInvitationInput,
   CreateInvitationInput,
   CreateWorkspaceInput,
+  DecideInvitationParams,
   MemberParams,
   RevokeInvitationParams,
   TransferOwnershipInput,
@@ -139,6 +140,26 @@ async function revokeInvitation(req: Request, res: Response, next: NextFunction)
   }
 }
 
+async function approveInvitation(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { id, invitationId } = req.params as unknown as DecideInvitationParams;
+    const result = await workspacesService.approveInvitation(id, req.auth!.sub, invitationId);
+    res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function rejectInvitation(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { id, invitationId } = req.params as unknown as DecideInvitationParams;
+    const result = await workspacesService.rejectInvitation(id, req.auth!.sub, invitationId);
+    res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function acceptInvitation(req: Request, res: Response, next: NextFunction) {
   try {
     const { token } = req.query as unknown as AcceptInvitationInput;
@@ -189,6 +210,8 @@ export const workspacesController = {
   createInvitation,
   listInvitations,
   revokeInvitation,
+  approveInvitation,
+  rejectInvitation,
   acceptInvitation,
   listMyInvitations,
   acceptInvitationById,

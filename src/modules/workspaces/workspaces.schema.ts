@@ -88,6 +88,11 @@ export const revokeInvitationSchema = z.object({
   params: z.object({ id: uuidParam, invitationId: uuidParam }),
 });
 
+// Aprobar o rechazar una solicitud (invitación en AWAITING_APPROVAL).
+export const decideInvitationSchema = z.object({
+  params: z.object({ id: uuidParam, invitationId: uuidParam }),
+});
+
 export const acceptInvitationSchema = z.object({
   query: z.object({
     token: z.string().min(1, 'Falta el token de invitación.'),
@@ -106,5 +111,6 @@ export type UpdateMemberRoleInput = z.infer<typeof updateMemberRoleSchema>['body
 export type TransferOwnershipInput = z.infer<typeof transferOwnershipSchema>['body'];
 export type CreateInvitationInput = z.infer<typeof createInvitationSchema>['body'];
 export type RevokeInvitationParams = z.infer<typeof revokeInvitationSchema>['params'];
+export type DecideInvitationParams = z.infer<typeof decideInvitationSchema>['params'];
 export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>['query'];
 export type AcceptInvitationByIdParams = z.infer<typeof acceptInvitationByIdSchema>['params'];

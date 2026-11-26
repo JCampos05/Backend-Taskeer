@@ -12,6 +12,7 @@ import type {
   ResetPasswordWithCodeInput,
   UpdateProfileInput,
   VerifyEmailInput,
+  VerifyWithRecoveryCodeInput,
 } from './auth.schema';
 
 // El controller nunca llama a Prisma directamente ni contiene lógica de
@@ -173,6 +174,18 @@ async function resetPasswordWithCode(req: Request, res: Response, next: NextFunc
   }
 }
 
+async function verifyWithRecoveryCode(req: Request, res: Response, next: NextFunction) {
+  try {
+    const input = req.body as VerifyWithRecoveryCodeInput;
+    const user = await authService.verifyWithRecoveryCode(req.auth!.sub, input, {
+      ipAddress: req.ip,
+    });
+    res.status(200).json({ user });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function regenerateRecoveryCodes(req: Request, res: Response, next: NextFunction) {
   try {
     const input = req.body as RegenerateRecoveryCodesInput;
@@ -235,6 +248,7 @@ export const authController = {
   googleLogin,
   refresh,
   resetPasswordWithCode,
+  verifyWithRecoveryCode,
   regenerateRecoveryCodes,
   changePassword,
   updateProfile,

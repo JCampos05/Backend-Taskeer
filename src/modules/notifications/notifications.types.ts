@@ -5,7 +5,15 @@
 export interface NotificationDto {
   id: string;
   userId: string;
-  type: 'REMINDER' | 'INVITATION' | 'ROLE_CHANGED' | 'MENTION' | 'RECOVERY_CODE_USED' | 'TASK_ASSIGNED';
+  type:
+    | 'REMINDER'
+    | 'INVITATION'
+    | 'ROLE_CHANGED'
+    | 'MENTION'
+    | 'RECOVERY_CODE_USED'
+    | 'TASK_ASSIGNED'
+    | 'INVITATION_REQUEST'
+    | 'INVITATION_DECISION';
   title: string;
   body: string | null;
   taskId: string | null;

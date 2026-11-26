@@ -13,6 +13,7 @@ import {
   resetPasswordWithCodeSchema,
   updateProfileSchema,
   verifyEmailSchema,
+  verifyWithRecoveryCodeSchema,
 } from './auth.schema';
 
 export const authRouter = Router();
@@ -104,6 +105,31 @@ authRouter.post(
   crearRateLimitAuth(10),
   validate(resetPasswordWithCodeSchema),
   authController.resetPasswordWithCode,
+);
+// Verifica la cuenta con uno de los códigos de recuperación propios (sin
+// Resend no hay verificación por correo). Mismo límite agresivo que el reset:
+// es un intento de adivinar el mismo secreto.
+// Además del límite por IP, otro por usuario: rotar de IP desde una misma
+// cuenta no reinicia el contador.
+authRouter.post(
+  '/auth/verify-with-recovery-code',
+  requireAuth,
+  crearRateLimitAuth(10),
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => `user:${req.auth?.sub ?? 'anon'}`,
+    message: {
+      error: {
+        code: 'TOO_MANY_REQUESTS',
+        message: 'Demasiados intentos. Intenta de nuevo más tarde.',
+      },
+    },
+  }),
+  validate(verifyWithRecoveryCodeSchema),
+  authController.verifyWithRecoveryCode,
 );
 // Requiere sesión activa — nunca "en frío" (ver docs/03-autenticacion-seguridad.md).
 // También lleva rate limit agresivo: aunque ya exige JWT válido, sin esto
