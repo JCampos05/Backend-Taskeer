@@ -452,6 +452,10 @@ model Column {
   isDoneColumn Boolean  @default(false)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+  // Soft delete (tombstone): un dispositivo que sincroniza tarde necesita saber
+  // que la columna se borró; con borrado físico no queda rastro y el dato
+  // "resucita" desde el otro dispositivo. Toda lectura filtra deletedAt: null.
+  deletedAt    DateTime?
 
   board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
   tasks Task[]
@@ -478,6 +482,11 @@ model Task {
   // idea de swimlanes que se había planteado (el usuario prefirió esto).
   priority    TaskPriority @default(MEDIUM)
   position    Int
+  // Instante (UTC) en que se completó la tarea, fijado por el CLIENTE (así
+  // funciona sin conexión). Independiente de la columna: Column.isDoneColumn
+  // sigue siendo un atajo de UI, pero completar y mover son operaciones
+  // distintas. null = no completada.
+  completedAt DateTime?
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
   deletedAt   DateTime?
@@ -525,11 +534,9 @@ model MyDayTask {
 
 // Paso/checklist dentro de una Task — se puede marcar completado
 // independientemente de en qué columna esté la tarea (ej. columna
-// "Terminado"). Deliberadamente sin `deletedAt` propio, mismo criterio que
-// Column (ver arriba): es un hijo desechable de Task, se borra físicamente
-// tal cual, y desaparece igual si la Task dueña queda soft-deleted (Task ya
-// se considera inexistente en ese caso, sin que haga falta cascadear el
-// estado acá).
+// "Terminado"). Tiene `deletedAt` (tombstone) para que la sincronización pueda
+// comunicar el borrado a otros dispositivos; toda lectura filtra
+// deletedAt: null. También desaparece si la Task dueña queda soft-deleted.
 model Subtask {
   id         String    @id @default(uuid()) @db.Char(36)
   taskId     String    @db.Char(36)
@@ -540,6 +547,7 @@ model Subtask {
   position   Int
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
 
   task     Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
   // Mismo criterio que Task.assignee: si se borra el usuario, la subtarea

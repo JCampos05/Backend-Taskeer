@@ -3,6 +3,11 @@ import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { boardsService } from '../boards/boards.service';
 import { pushNotification } from '../notifications/notifications.stream';
+import {
+  idAlreadyInUseError,
+  isUniqueConstraintError,
+  type CreatedResult,
+} from '../../utils/idempotent-create';
 import type {
   CreateSubtaskInput,
   CreateTaskInput,
@@ -27,6 +32,7 @@ function toTaskDto(task: {
   dueAt: Date | null;
   priority: PrismaTaskPriority;
   position: number;
+  completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }): TaskDto {
@@ -39,6 +45,7 @@ function toTaskDto(task: {
     dueAt: task.dueAt ? task.dueAt.toISOString() : null,
     priority: task.priority,
     position: task.position,
+    completedAt: task.completedAt ? task.completedAt.toISOString() : null,
     createdAt: task.createdAt.toISOString(),
     updatedAt: task.updatedAt.toISOString(),
   };
@@ -70,15 +77,15 @@ function resolveEffectiveRole(boardId: string, membership: WorkspaceMember): Pro
 }
 
 /** Resuelve una columna (y su board/workspace) no borrados a partir de su id.
- * Column no tiene deletedAt propio, pero se considera inexistente si su Board
- * está soft-deleted. Usado antes de crear/mover una tarea hacia esa columna. */
+ * Se considera inexistente si la columna está soft-deleted o si su Board lo
+ * está. Usado antes de crear/mover una tarea hacia esa columna. */
 async function requireColumnContext(columnId: string) {
   const column = await prisma.column.findUnique({
     where: { id: columnId },
     include: { board: true },
   });
 
-  if (!column || column.board.deletedAt !== null) {
+  if (!column || column.deletedAt !== null || column.board.deletedAt !== null) {
     throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
   }
 
@@ -109,6 +116,9 @@ async function requireTaskAccess(taskId: string, userId: string) {
   if (
     !task ||
     task.deletedAt !== null ||
+    // Una tarea cuya columna se borró en paralelo (carrera con deleteColumn)
+    // deja de ser accesible en vez de quedar viva en una columna invisible.
+    task.column.deletedAt !== null ||
     task.column.board.deletedAt !== null ||
     task.column.board.workspace.deletedAt !== null
   ) {
@@ -188,7 +198,21 @@ async function notifyTaskAssigned(
   pushNotification(notification);
 }
 
-async function createTask(userId: string, input: CreateTaskInput): Promise<TaskDto> {
+/** Creación idempotente por `id` del cliente: si ya existe en la MISMA columna
+ * y no está borrada se devuelve tal cual; en cualquier otro caso (otra
+ * columna, borrada, ajena) 409 genérico. Se llama solo tras comprobar permisos
+ * de escritura, así que no filtra nada a quien no tiene acceso. */
+function resolveExistingTask(
+  existing: Parameters<typeof toTaskDto>[0] & { deletedAt: Date | null },
+  columnId: string,
+): CreatedResult<TaskDto> {
+  if (existing.columnId !== columnId || existing.deletedAt !== null) {
+    throw idAlreadyInUseError();
+  }
+  return { value: toTaskDto(existing), created: false };
+}
+
+async function createTask(userId: string, input: CreateTaskInput): Promise<CreatedResult<TaskDto>> {
   const { column, board } = await requireColumnContext(input.columnId);
 
   const membership = await getMembership(board.workspaceId, userId);
@@ -196,6 +220,13 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<TaskD
     throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
   }
   requireMutationRole(await resolveEffectiveRole(board.id, membership));
+
+  // Un reintento de una creación ya aplicada no debe toparse con el límite
+  // WIP ni con otras reglas: se resuelve antes de ellas.
+  if (input.id) {
+    const existing = await prisma.task.findUnique({ where: { id: input.id } });
+    if (existing) return resolveExistingTask(existing, column.id);
+  }
 
   await assertAssigneeIsMember(board.workspaceId, input.assigneeId);
   await assertWipLimitNotReached(column.id, column.wipLimit);
@@ -209,23 +240,36 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<TaskD
   });
   const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
-  const task = await prisma.task.create({
-    data: {
-      columnId: input.columnId,
-      assigneeId: input.assigneeId ?? null,
-      title: input.title,
-      description: input.description ?? null,
-      dueAt: input.dueAt ? new Date(input.dueAt) : null,
-      priority: input.priority ?? 'MEDIUM',
-      position: nextPosition,
-    },
-  });
+  let task;
+  try {
+    task = await prisma.task.create({
+      data: {
+        ...(input.id ? { id: input.id } : {}),
+        columnId: input.columnId,
+        assigneeId: input.assigneeId ?? null,
+        title: input.title,
+        description: input.description ?? null,
+        dueAt: input.dueAt ? new Date(input.dueAt) : null,
+        priority: input.priority ?? 'MEDIUM',
+        position: nextPosition,
+        completedAt: input.completedAt ? new Date(input.completedAt) : null,
+      },
+    });
+  } catch (err) {
+    // Dos creaciones simultáneas con el mismo id: la segunda pierde la
+    // carrera y se resuelve como reintento idempotente.
+    if (input.id && isUniqueConstraintError(err)) {
+      const existing = await prisma.task.findUnique({ where: { id: input.id } });
+      if (existing) return resolveExistingTask(existing, column.id);
+    }
+    throw err;
+  }
 
   if (task.assigneeId) {
     await notifyTaskAssigned(task.id, task.title, task.assigneeId, userId);
   }
 
-  return toTaskDto(task);
+  return { value: toTaskDto(task), created: true };
 }
 
 async function listTasksByBoard(
@@ -252,7 +296,11 @@ async function listTasksByBoard(
   }
 
   const tasks = await prisma.task.findMany({
-    where: { deletedAt: null, column: { boardId }, ...(priority ? { priority } : {}) },
+    where: {
+      deletedAt: null,
+      column: { boardId, deletedAt: null },
+      ...(priority ? { priority } : {}),
+    },
     orderBy: [{ column: { position: 'asc' } }, { position: 'asc' }],
   });
 
@@ -280,6 +328,9 @@ async function updateTask(taskId: string, userId: string, input: UpdateTaskInput
       ...(input.dueAt !== undefined ? { dueAt: input.dueAt ? new Date(input.dueAt) : null } : {}),
       ...(input.assigneeId !== undefined ? { assigneeId: input.assigneeId } : {}),
       ...(input.priority !== undefined ? { priority: input.priority } : {}),
+      ...(input.completedAt !== undefined
+        ? { completedAt: input.completedAt ? new Date(input.completedAt) : null }
+        : {}),
     },
   });
 
@@ -447,7 +498,7 @@ async function requireSubtask(taskId: string, subtaskId: string) {
   const notFoundError = new AppError(404, 'SUBTASK_NOT_FOUND', 'El paso no existe.');
 
   const subtask = await prisma.subtask.findUnique({ where: { id: subtaskId } });
-  if (!subtask || subtask.taskId !== taskId) {
+  if (!subtask || subtask.taskId !== taskId || subtask.deletedAt !== null) {
     throw notFoundError;
   }
 
@@ -458,40 +509,67 @@ async function listSubtasks(taskId: string, userId: string): Promise<SubtaskDto[
   await requireTaskAccess(taskId, userId);
 
   const subtasks = await prisma.subtask.findMany({
-    where: { taskId },
+    where: { taskId, deletedAt: null },
     orderBy: { position: 'asc' },
   });
 
   return subtasks.map(toSubtaskDto);
 }
 
+/** Misma idea que resolveExistingTask: reintento idempotente si el paso ya
+ * existe en la MISMA tarea y no está borrado; si no, 409 genérico. */
+function resolveExistingSubtask(
+  existing: Parameters<typeof toSubtaskDto>[0] & { deletedAt: Date | null },
+  taskId: string,
+): CreatedResult<SubtaskDto> {
+  if (existing.taskId !== taskId || existing.deletedAt !== null) {
+    throw idAlreadyInUseError();
+  }
+  return { value: toSubtaskDto(existing), created: false };
+}
+
 async function createSubtask(
   taskId: string,
   userId: string,
   input: CreateSubtaskInput,
-): Promise<SubtaskDto> {
+): Promise<CreatedResult<SubtaskDto>> {
   const { board, workspaceId, membership } = await requireTaskAccess(taskId, userId);
   requireMutationRole(await resolveEffectiveRole(board.id, membership));
+
+  if (input.id) {
+    const existing = await prisma.subtask.findUnique({ where: { id: input.id } });
+    if (existing) return resolveExistingSubtask(existing, taskId);
+  }
 
   await assertAssigneeIsMember(workspaceId, input.assigneeId);
 
   const highestPosition = await prisma.subtask.aggregate({
-    where: { taskId },
+    where: { taskId, deletedAt: null },
     _max: { position: true },
   });
   const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
-  const subtask = await prisma.subtask.create({
-    data: {
-      taskId,
-      assigneeId: input.assigneeId ?? null,
-      title: input.title,
-      dueAt: input.dueAt ? new Date(input.dueAt) : null,
-      position: nextPosition,
-    },
-  });
+  let subtask;
+  try {
+    subtask = await prisma.subtask.create({
+      data: {
+        ...(input.id ? { id: input.id } : {}),
+        taskId,
+        assigneeId: input.assigneeId ?? null,
+        title: input.title,
+        dueAt: input.dueAt ? new Date(input.dueAt) : null,
+        position: nextPosition,
+      },
+    });
+  } catch (err) {
+    if (input.id && isUniqueConstraintError(err)) {
+      const existing = await prisma.subtask.findUnique({ where: { id: input.id } });
+      if (existing) return resolveExistingSubtask(existing, taskId);
+    }
+    throw err;
+  }
 
-  return toSubtaskDto(subtask);
+  return { value: toSubtaskDto(subtask), created: true };
 }
 
 async function updateSubtask(
@@ -529,7 +607,7 @@ async function updateSubtask(
   // reacomoda el position de los demás subtasks de la misma tarea.
   const updatedSubtask = await prisma.$transaction(async (tx) => {
     const siblings = await tx.subtask.findMany({
-      where: { taskId },
+      where: { taskId, deletedAt: null },
       orderBy: { position: 'asc' },
     });
 
@@ -569,10 +647,13 @@ async function deleteSubtask(taskId: string, subtaskId: string, userId: string):
   requireMutationRole(await resolveEffectiveRole(board.id, membership));
   const subtask = await requireSubtask(taskId, subtaskId);
 
-  // Hard delete — a diferencia de Task, Subtask no tiene deletedAt propio
-  // (mismo criterio que Column, ver schema.prisma): es un hijo desechable,
-  // se borra tal cual.
-  await prisma.subtask.delete({ where: { id: subtask.id } });
+  // Soft delete (tombstone) — la sincronización necesita poder comunicar el
+  // borrado a otros dispositivos. Condicionado a deletedAt null para que dos
+  // borrados simultáneos no pisen la fecha.
+  await prisma.subtask.updateMany({
+    where: { id: subtask.id, deletedAt: null },
+    data: { deletedAt: new Date() },
+  });
 }
 
 /** Cuántas tareas asignadas al usuario están vencidas (`dueAt` ya pasó),
@@ -592,9 +673,12 @@ async function countOverdueForUser(userId: string): Promise<number> {
     where: {
       assigneeId: userId,
       deletedAt: null,
+      // Pendiente = sin completedAt Y fuera de una columna de cierre.
+      completedAt: null,
       dueAt: { lt: new Date() },
       column: {
         isDoneColumn: false,
+        deletedAt: null,
         board: {
           deletedAt: null,
           workspace: { deletedAt: null, members: { some: { userId } } },
@@ -618,6 +702,7 @@ async function listAssignedWithDueDate(userId: string): Promise<AssignedTaskDto[
     where: {
       assigneeId: userId,
       deletedAt: null,
+      completedAt: null,
       dueAt: { not: null },
       column: {
         // No mostrar como pendiente lo que ya está en una columna de
@@ -625,6 +710,7 @@ async function listAssignedWithDueDate(userId: string): Promise<AssignedTaskDto[
         // existiera, una tarea en "Hecho" seguía apareciendo acá como si
         // faltara hacerla.
         isDoneColumn: false,
+        deletedAt: null,
         board: {
           deletedAt: null,
           workspace: { deletedAt: null, members: { some: { userId } } },
@@ -694,11 +780,13 @@ async function listMyDayTasks(userId: string): Promise<MyDayTaskDto[]> {
       userId,
       task: {
         deletedAt: null,
+        completedAt: null,
         column: {
           // Mismo criterio que listAssignedWithDueDate — si el usuario
           // terminó la tarea después de marcarla, deja de mostrarse como
           // pendiente en "Mi día" aunque la marca manual siga existiendo.
           isDoneColumn: false,
+          deletedAt: null,
           board: {
             deletedAt: null,
             workspace: { deletedAt: null, members: { some: { userId } } },

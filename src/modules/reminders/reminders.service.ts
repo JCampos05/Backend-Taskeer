@@ -172,6 +172,7 @@ async function listUpcomingForUser(userId: string): Promise<UpcomingReminderDto[
         assigneeId: userId,
         deletedAt: null,
         column: {
+          deletedAt: null,
           board: {
             deletedAt: null,
             // workspace.deletedAt también, no solo board.deletedAt — un

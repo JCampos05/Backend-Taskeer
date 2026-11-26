@@ -16,6 +16,8 @@ export const workspaceIdParamSchema = z.object({
 export const createBoardSchema = z.object({
   params: z.object({ workspaceId: uuidParam }),
   body: z.object({
+    // UUID generado por el cliente; creación idempotente (ver boards.service.ts).
+    id: uuidParam.optional(),
     name: z
       .string()
       .trim()
@@ -65,6 +67,7 @@ const wipLimitField = z
 export const createColumnSchema = z.object({
   params: z.object({ workspaceId: uuidParam, boardId: uuidParam }),
   body: z.object({
+    id: uuidParam.optional(),
     name: z
       .string()
       .trim()

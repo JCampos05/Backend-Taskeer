@@ -4,6 +4,11 @@ import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { pushNotification } from '../notifications/notifications.stream';
+import {
+  idAlreadyInUseError,
+  isUniqueConstraintError,
+  type CreatedResult,
+} from '../../utils/idempotent-create';
 import type {
   CreateBoardInput,
   CreateColumnInput,
@@ -204,22 +209,58 @@ async function requireBoard(workspaceId: string, boardId: string) {
   return board;
 }
 
+/** Creación idempotente por `id` del cliente: si ya existe en el MISMO
+ * workspace y no está borrado se devuelve tal cual; si no, 409 genérico. Solo
+ * se llama tras comprobar permisos de escritura. */
+function resolveExistingBoard(
+  existing: Parameters<typeof toBoardDto>[0] & { deletedAt: Date | null },
+  workspaceId: string,
+): CreatedResult<BoardDto> {
+  if (existing.workspaceId !== workspaceId || existing.deletedAt !== null) {
+    throw idAlreadyInUseError();
+  }
+  return { value: toBoardDto(existing), created: false };
+}
+
 async function createBoard(
   workspaceId: string,
   userId: string,
   input: CreateBoardInput,
-): Promise<BoardDto> {
+): Promise<CreatedResult<BoardDto>> {
   const { membership } = await requireMembership(workspaceId, userId);
   // Sin resolveEffectiveRole acá — el board todavía no existe, no puede
   // haber un override sobre él. Crear boards siempre depende del rol de
   // workspace crudo.
   requireOwnerOrAdmin(membership.role);
 
+  if (input.id) {
+    const existing = await prisma.board.findUnique({ where: { id: input.id } });
+    if (existing) return resolveExistingBoard(existing, workspaceId);
+  }
+
   const slug = await generateUniqueSlug(workspaceId, input.name);
 
-  const board = await prisma.$transaction(async (tx) => {
+  let board;
+  try {
+    board = await createBoardWithColumns(workspaceId, input, slug);
+  } catch (err) {
+    // Dos creaciones simultáneas con el mismo id: la segunda se resuelve como
+    // reintento idempotente. Si el P2002 era por el slug (no por el id), no
+    // existe un board con ese id y se relanza el error original.
+    if (input.id && isUniqueConstraintError(err)) {
+      const existing = await prisma.board.findUnique({ where: { id: input.id } });
+      if (existing) return resolveExistingBoard(existing, workspaceId);
+    }
+    throw err;
+  }
+
+  return { value: toBoardDto(board), created: true };
+}
+
+async function createBoardWithColumns(workspaceId: string, input: CreateBoardInput, slug: string) {
+  return prisma.$transaction(async (tx) => {
     const createdBoard = await tx.board.create({
-      data: { workspaceId, name: input.name, slug },
+      data: { ...(input.id ? { id: input.id } : {}), workspaceId, name: input.name, slug },
     });
 
     // Siembra las columnas predefinidas en la misma transacción — un Board
@@ -237,8 +278,6 @@ async function createBoard(
 
     return createdBoard;
   });
-
-  return toBoardDto(board);
 }
 
 async function listBoards(workspaceId: string, userId: string): Promise<BoardDto[]> {
@@ -267,7 +306,7 @@ async function getBoardById(
   const viewerEffectiveRole = await resolveEffectiveRole(board.id, membership);
 
   const columns = await prisma.column.findMany({
-    where: { boardId: board.id },
+    where: { boardId: board.id, deletedAt: null },
     orderBy: { position: 'asc' },
     include: {
       tasks: {
@@ -277,7 +316,7 @@ async function getBoardById(
           // Solo se necesita el booleano para contar hechos/total — traer
           // los subtasks completos de cada tarea del board de una vez es
           // barato (son listas chicas) y evita una request por tarjeta.
-          subtasks: { select: { completed: true } },
+          subtasks: { where: { deletedAt: null }, select: { completed: true } },
         },
       },
     },
@@ -378,28 +417,54 @@ async function createColumn(
   boardId: string,
   userId: string,
   input: CreateColumnInput,
-): Promise<ColumnDto> {
+): Promise<CreatedResult<ColumnDto>> {
   const { membership } = await requireMembership(workspaceId, userId);
   await requireBoard(workspaceId, boardId);
   requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
+  // Creación idempotente por `id` del cliente: existe en el MISMO tablero y
+  // no está borrada => se devuelve; cualquier otro caso => 409 genérico.
+  const resolveExisting = (
+    existing: Parameters<typeof toColumnDto>[0] & { deletedAt: Date | null },
+  ): CreatedResult<ColumnDto> => {
+    if (existing.boardId !== boardId || existing.deletedAt !== null) {
+      throw idAlreadyInUseError();
+    }
+    return { value: toColumnDto(existing), created: false };
+  };
+
+  if (input.id) {
+    const existing = await prisma.column.findUnique({ where: { id: input.id } });
+    if (existing) return resolveExisting(existing);
+  }
+
   const highestPosition = await prisma.column.aggregate({
-    where: { boardId },
+    where: { boardId, deletedAt: null },
     _max: { position: true },
   });
   const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
-  const column = await prisma.column.create({
-    data: {
-      boardId,
-      name: input.name,
-      position: nextPosition,
-      wipLimit: input.wipLimit ?? null,
-      isDoneColumn: input.isDoneColumn ?? false,
-    },
-  });
+  let column;
+  try {
+    column = await prisma.column.create({
+      data: {
+        ...(input.id ? { id: input.id } : {}),
+        boardId,
+        name: input.name,
+        position: nextPosition,
+        wipLimit: input.wipLimit ?? null,
+        isDoneColumn: input.isDoneColumn ?? false,
+      },
+    });
+  } catch (err) {
+    if (input.id && isUniqueConstraintError(err)) {
+      const existing = await prisma.column.findUnique({ where: { id: input.id } });
+      if (existing) return resolveExisting(existing);
+    }
+    throw err;
+  }
 
-  return toColumnDto(column);
+  return { value: toColumnDto(column), created: true };
 }
 
 async function updateColumn(
@@ -413,7 +478,7 @@ async function updateColumn(
   await requireBoard(workspaceId, boardId);
   requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
-  const column = await prisma.column.findFirst({ where: { id: columnId, boardId } });
+  const column = await prisma.column.findFirst({ where: { id: columnId, boardId, deletedAt: null } });
   if (!column) {
     throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
   }
@@ -430,7 +495,7 @@ async function updateColumn(
   // consistente — mismo principio que el reordenamiento de Task en
   // tasks.service.ts (moveTask), aplicado a una sola lista en vez de dos.
   const siblings = await prisma.column.findMany({
-    where: { boardId },
+    where: { boardId, deletedAt: null },
     orderBy: { position: 'asc' },
   });
 
@@ -470,19 +535,16 @@ async function deleteColumn(
   await requireBoard(workspaceId, boardId);
   requireOwnerOrAdmin(await resolveEffectiveRole(boardId, membership));
 
-  const column = await prisma.column.findFirst({ where: { id: columnId, boardId } });
+  const column = await prisma.column.findFirst({ where: { id: columnId, boardId, deletedAt: null } });
   if (!column) {
     throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
   }
 
-  // Column no tiene deletedAt en el schema y su relación con Task usa
-  // onDelete: Cascade a nivel de base de datos — si se permitiera borrar una
-  // columna con tareas, el cascade borraría filas de Task físicamente sin
-  // pasar por deletedAt, violando la regla de soft delete de CLAUDE.md.
-  // Por eso se cuenta CUALQUIER Task de la columna, incluidas las ya
-  // soft-deleted, y se bloquea el borrado si hay alguna — nunca se deja que
-  // el cascade se dispare sobre nada.
-  const taskCount = await prisma.task.count({ where: { columnId } });
+  // Ahora la columna se borra con soft delete (tombstone), así que ya no hay
+  // cascade físico sobre Task: basta con exigir que no tenga tareas VIVAS.
+  // (Antes se contaban también las soft-deleted para que el cascade no
+  // destruyera filas; con deletedAt eso dejó de ser un riesgo.)
+  const taskCount = await prisma.task.count({ where: { columnId, deletedAt: null } });
   if (taskCount > 0) {
     throw new AppError(
       409,
@@ -491,8 +553,11 @@ async function deleteColumn(
     );
   }
 
-  // Hard delete real — Column no soporta soft delete en el schema actual.
-  await prisma.column.delete({ where: { id: columnId } });
+  // Condicionado a deletedAt null: dos borrados simultáneos no pisan la fecha.
+  await prisma.column.updateMany({
+    where: { id: columnId, deletedAt: null },
+    data: { deletedAt: new Date() },
+  });
 }
 
 // --- Roles por tablero individual (overrides) ---

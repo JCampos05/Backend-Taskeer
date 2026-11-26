@@ -41,7 +41,12 @@ async function dispararRecordatoriosVencidos(): Promise<void> {
       // recurso inaccesible. Se descarta (DISMISSED) en vez de dejarlo PENDING,
       // que lo reintentaría cada minuto para siempre.
       const { task } = recordatorio;
-      if (task.deletedAt || task.column.board.deletedAt || task.column.board.workspace.deletedAt) {
+      if (
+        task.deletedAt ||
+        task.column.deletedAt ||
+        task.column.board.deletedAt ||
+        task.column.board.workspace.deletedAt
+      ) {
         await prisma.reminder.updateMany({
           where: { id: recordatorio.id, status: 'PENDING' },
           data: { status: 'DISMISSED' },

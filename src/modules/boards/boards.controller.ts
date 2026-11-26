@@ -31,8 +31,13 @@ async function create(req: Request, res: Response, next: NextFunction) {
   try {
     const { workspaceId } = req.params as unknown as WorkspaceIdParams;
     const input = req.body as CreateBoardInput;
-    const board = await boardsService.createBoard(workspaceId, req.auth!.sub, input);
-    res.status(201).json({ board });
+    const { value: board, created } = await boardsService.createBoard(
+      workspaceId,
+      req.auth!.sub,
+      input,
+    );
+    // 200 si fue un reintento idempotente de una creación ya aplicada.
+    res.status(created ? 201 : 200).json({ board });
   } catch (err) {
     next(err);
   }
@@ -83,8 +88,13 @@ async function createColumn(req: Request, res: Response, next: NextFunction) {
   try {
     const { workspaceId, boardId } = req.params as unknown as BoardIdParams;
     const input = req.body as CreateColumnInput;
-    const column = await boardsService.createColumn(workspaceId, boardId, req.auth!.sub, input);
-    res.status(201).json({ column });
+    const { value: column, created } = await boardsService.createColumn(
+      workspaceId,
+      boardId,
+      req.auth!.sub,
+      input,
+    );
+    res.status(created ? 201 : 200).json({ column });
   } catch (err) {
     next(err);
   }

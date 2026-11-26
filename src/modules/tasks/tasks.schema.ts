@@ -13,6 +13,10 @@ const taskPriority = z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']);
 
 export const createTaskSchema = z.object({
   body: z.object({
+    // UUID generado por el cliente (apps offline-first). Si se omite, lo
+    // genera el servidor; si ya existe en el mismo contexto, la creación es
+    // idempotente (devuelve la existente). Ver tasks.service.ts.
+    id: uuidParam.optional(),
     columnId: uuidParam,
     title: z
       .string()
@@ -23,6 +27,7 @@ export const createTaskSchema = z.object({
     dueAt: isoDateString.optional(),
     assigneeId: uuidParam.optional(),
     priority: taskPriority.optional(),
+    completedAt: isoDateString.optional(),
   }),
 });
 
@@ -56,6 +61,9 @@ export const updateTaskSchema = z.object({
       dueAt: isoDateString.nullable().optional(),
       assigneeId: uuidParam.nullable().optional(),
       priority: taskPriority.optional(),
+      // El cliente envía el instante en que completó la tarea (null = la
+      // reabre). El servidor no mueve la tarea de columna por su cuenta.
+      completedAt: isoDateString.nullable().optional(),
     })
     .refine(
       (data) =>
@@ -63,7 +71,8 @@ export const updateTaskSchema = z.object({
         data.description !== undefined ||
         data.dueAt !== undefined ||
         data.assigneeId !== undefined ||
-        data.priority !== undefined,
+        data.priority !== undefined ||
+        data.completedAt !== undefined,
       { message: 'Debes enviar al menos un campo para actualizar.' },
     ),
 });
@@ -84,6 +93,7 @@ export const moveTaskSchema = z.object({
 export const createSubtaskSchema = z.object({
   params: z.object({ taskId: uuidParam }),
   body: z.object({
+    id: uuidParam.optional(),
     title: z
       .string()
       .trim()

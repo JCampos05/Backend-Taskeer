@@ -17,8 +17,8 @@ import type {
 async function create(req: Request, res: Response, next: NextFunction) {
   try {
     const input = req.body as CreateTaskInput;
-    const task = await tasksService.createTask(req.auth!.sub, input);
-    res.status(201).json({ task });
+    const { value: task, created } = await tasksService.createTask(req.auth!.sub, input);
+    res.status(created ? 201 : 200).json({ task });
   } catch (err) {
     next(err);
   }
@@ -90,8 +90,12 @@ async function createSubtask(req: Request, res: Response, next: NextFunction) {
   try {
     const { taskId } = req.params as unknown as TaskIdParams;
     const input = req.body as CreateSubtaskInput;
-    const subtask = await tasksService.createSubtask(taskId, req.auth!.sub, input);
-    res.status(201).json({ subtask });
+    const { value: subtask, created } = await tasksService.createSubtask(
+      taskId,
+      req.auth!.sub,
+      input,
+    );
+    res.status(created ? 201 : 200).json({ subtask });
   } catch (err) {
     next(err);
   }

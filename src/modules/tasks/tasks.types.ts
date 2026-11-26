@@ -16,6 +16,9 @@ export interface TaskDto {
   dueAt: string | null;
   priority: TaskPriority;
   position: number;
+  // Instante UTC en que el cliente marcó la tarea como completada; null = no
+  // completada. Independiente de la columna en que esté la tarea.
+  completedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
