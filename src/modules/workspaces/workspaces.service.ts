@@ -44,6 +44,7 @@ function toWorkspaceDto(workspace: {
   name: string;
   slug: string;
   ownerId: string;
+  isPersonal: boolean;
   createdAt: Date;
   updatedAt: Date;
 }): WorkspaceDto {
@@ -52,6 +53,7 @@ function toWorkspaceDto(workspace: {
     name: workspace.name,
     slug: workspace.slug,
     ownerId: workspace.ownerId,
+    isPersonal: workspace.isPersonal,
     createdAt: workspace.createdAt.toISOString(),
     updatedAt: workspace.updatedAt.toISOString(),
   };
@@ -189,7 +191,9 @@ async function createWorkspace(userId: string, input: CreateWorkspaceInput): Pro
 
   if (limiteWorkspaces !== null) {
     const cantidadActual = await prisma.workspace.count({
-      where: { ownerId: userId, deletedAt: null },
+      // El workspace Personal que todo usuario recibe al registrarse no
+      // consume el cupo del plan.
+      where: { ownerId: userId, deletedAt: null, isPersonal: false },
     });
 
     if (cantidadActual >= limiteWorkspaces) {
@@ -222,7 +226,9 @@ async function listWorkspaces(userId: string): Promise<WorkspaceListItemDto[]> {
   const memberships = await prisma.workspaceMember.findMany({
     where: { userId, workspace: { deletedAt: null } },
     include: { workspace: true },
-    orderBy: { workspace: { createdAt: 'desc' } },
+    // El workspace Personal siempre primero (es el ancla de la pantalla); el
+    // resto, del más reciente al más antiguo.
+    orderBy: [{ workspace: { isPersonal: 'desc' } }, { workspace: { createdAt: 'desc' } }],
   });
 
   return memberships.map((membership) => ({
@@ -245,6 +251,11 @@ async function updateWorkspace(
   requireOwnerOrAdmin(membership);
 
   if (input.slug !== undefined) {
+    // `personal-<id>` es el slug que reciben los workspaces Personales: se
+    // reserva para que nadie lo ocupe antes de que su dueño real lo necesite.
+    if (input.slug.startsWith('personal-')) {
+      throw new AppError(400, 'SLUG_RESERVED', 'Ese identificador está reservado.');
+    }
     const existing = await prisma.workspace.findUnique({ where: { slug: input.slug } });
     if (existing && existing.id !== workspaceId) {
       throw new AppError(409, 'SLUG_ALREADY_TAKEN', 'Ese identificador ya está en uso.');
@@ -262,8 +273,21 @@ async function updateWorkspace(
   return toWorkspaceDto(updated);
 }
 
+/** El workspace Personal es de uso exclusivo de su dueño y aloja sus listas y
+ * tableros propios: no se borra, no se transfiere y no admite invitados. */
+function assertNotPersonal(workspace: { isPersonal: boolean }, accion: string) {
+  if (workspace.isPersonal) {
+    throw new AppError(
+      400,
+      'PERSONAL_WORKSPACE_PROTECTED',
+      `El workspace Personal no se puede ${accion}.`,
+    );
+  }
+}
+
 async function deleteWorkspace(workspaceId: string, userId: string): Promise<void> {
-  const { membership } = await requireMembership(workspaceId, userId);
+  const { workspace, membership } = await requireMembership(workspaceId, userId);
+  assertNotPersonal(workspace, 'borrar');
 
   // Ni siquiera ADMIN puede borrar el workspace — exclusivo del OWNER (ver
   // docs/02-modelo-datos.md).
@@ -436,6 +460,8 @@ async function transferOwnership(
     actingUserId,
   );
 
+  assertNotPersonal(workspace, 'transferir');
+
   if (actingMembership.role !== 'OWNER') {
     throw new AppError(
       403,
@@ -500,6 +526,7 @@ async function createInvitation(
     actingUserId,
   );
   requireOwnerOrAdmin(actingMembership);
+  assertNotPersonal(workspace, 'compartir con otras personas');
 
   const actingUser = await prisma.user.findUnique({ where: { id: actingUserId } });
   if (!actingUser) {
@@ -706,6 +733,7 @@ type WorkspaceRow = {
   name: string;
   slug: string;
   ownerId: string;
+  isPersonal: boolean;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -731,6 +759,9 @@ async function requestInvitationApproval(
   workspace: WorkspaceRow,
   user: { id: string; displayName: string; emailVerifiedAt: Date | null },
 ): Promise<AcceptInvitationResultDto> {
+  // Defensa en profundidad (ver approveInvitation).
+  assertNotPersonal(workspace, 'compartir con otras personas');
+
   const workspaceDto = toWorkspaceDto(workspace);
 
   const existingMember = await prisma.workspaceMember.findFirst({
@@ -835,6 +866,9 @@ async function approveInvitation(
 ): Promise<InvitationDecisionResultDto> {
   const { workspace, membership } = await requireMembership(workspaceId, actingUserId);
   requireOwnerOrAdmin(membership);
+  // Defensa en profundidad: el workspace Personal nunca recibe a otra persona,
+  // aunque existiera una invitación heredada o creada por otra vía.
+  assertNotPersonal(workspace, 'compartir con otras personas');
 
   const notFoundError = new AppError(
     404,

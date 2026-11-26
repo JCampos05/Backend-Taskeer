@@ -1,13 +1,21 @@
+import { createHash } from 'node:crypto';
 import { Router } from 'express';
+import type { Request } from 'express';
 import rateLimit from 'express-rate-limit';
 import { requireAuth } from '../../middlewares/requireAuth';
-import { requireTrustedOrigin } from '../../middlewares/requireTrustedOrigin';
+import {
+  isMobileClient,
+  requireTrustedOriginUnlessMobile,
+  validateWhenMobile,
+} from '../../middlewares/mobileClient';
 import { validate } from '../../middlewares/validate';
 import { authController } from './auth.controller';
 import {
   changePasswordSchema,
   googleLoginSchema,
+  googleMobileLoginSchema,
   loginSchema,
+  mobileRefreshTokenSchema,
   regenerateRecoveryCodesSchema,
   registerSchema,
   resetPasswordWithCodeSchema,
@@ -30,10 +38,11 @@ export const authRouter = Router();
 // cada recarga de página vía bootstrap(), así que agotaba en minutos el
 // mismo contador que protege /auth/login contra fuerza bruta, bloqueando
 // login sin que el usuario hubiera fallado ni un intento real ahí).
-function crearRateLimitAuth(limit: number) {
+function crearRateLimitAuth(limit: number, keyGenerator?: (req: Request) => string) {
   return rateLimit({
     windowMs: 15 * 60 * 1000,
     limit,
+    ...(keyGenerator ? { keyGenerator } : {}),
     standardHeaders: true,
     legacyHeaders: false,
     message: {
@@ -92,11 +101,37 @@ authRouter.post(
 // `requireTrustedOrigin`: con la cookie en `sameSite: 'none'`, esta ruta no
 // exige ningún body validado — sin este chequeo de `Origin`, CSRF real (ver
 // docs/03-autenticacion-seguridad.md, sección de cookies cross-site).
+// Cliente móvil (`X-Client: mobile`): sin cookies ni `Origin`; el refresh token
+// viaja en el cuerpo y la cookie se ignora (ver middlewares/mobileClient.ts
+// para por qué esto no debilita la protección CSRF de la web).
+// Clave del límite de /auth/refresh (logout no tiene límite propio): en móvil, el hash del refresh token del
+// cuerpo (así muchos móviles detrás de una misma IP —CGNAT, wifi compartida—
+// no agotan un contador común, y se sigue frenando el replay rápido de UN
+// token); en la web, la IP como siempre. El techo por IP del límite global de
+// la API sigue aplicando. Nunca se usa el token en claro como clave.
+function claveRefresh(req: Request): string {
+  const token = (req.body as { refreshToken?: unknown } | undefined)?.refreshToken;
+  if (isMobileClient(req) && typeof token === 'string' && token.length > 0) {
+    return `rt:${createHash('sha256').update(token.slice(0, 256)).digest('hex')}`;
+  }
+  return req.ip ?? 'unknown';
+}
+
 authRouter.post(
   '/auth/refresh',
-  requireTrustedOrigin,
-  crearRateLimitAuth(60),
+  requireTrustedOriginUnlessMobile,
+  crearRateLimitAuth(60, claveRefresh),
+  validateWhenMobile(mobileRefreshTokenSchema),
   authController.refresh,
+);
+// Login con Google desde la app: recibe el access token de Supabase (sin el
+// nonce `state` del flujo de navegador) y devuelve la sesión en JSON. Mismo
+// límite que /auth/google.
+authRouter.post(
+  '/auth/google/mobile',
+  crearRateLimitAuth(20),
+  validate(googleMobileLoginSchema),
+  authController.googleMobileLogin,
 );
 // Igual de agresivo que login — incluso más crítico: solo 10 códigos fijos
 // por cuenta para adivinar (ver docs/03-autenticacion-seguridad.md).
@@ -164,4 +199,9 @@ authRouter.patch(
   authController.updateProfile,
 );
 
-authRouter.post('/auth/logout', requireTrustedOrigin, authController.logout);
+authRouter.post(
+  '/auth/logout',
+  requireTrustedOriginUnlessMobile,
+  validateWhenMobile(mobileRefreshTokenSchema),
+  authController.logout,
+);

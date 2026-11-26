@@ -9,6 +9,9 @@ export interface WorkspaceDto {
   name: string;
   slug: string;
   ownerId: string;
+  // Workspace "Personal" del usuario: no se borra, no se transfiere, no se
+  // invita a nadie y no cuenta contra el límite de workspaces del plan.
+  isPersonal: boolean;
   createdAt: string;
   updatedAt: string;
 }

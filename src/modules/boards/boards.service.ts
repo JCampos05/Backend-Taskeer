@@ -198,8 +198,11 @@ function toBoardMemberOverrideDto(override: {
 /** Resuelve un board no borrado dentro del workspace dado, o 404 uniforme —
  * no distingue "no existe" de "pertenece a otro workspace/está borrado". */
 async function requireBoard(workspaceId: string, boardId: string) {
+  // isList: false — las listas planas de la app móvil son boards ocultos que
+  // solo se gestionan por /lists; por los endpoints de tableros/columnas
+  // responden 404 como si no existieran.
   const board = await prisma.board.findFirst({
-    where: { id: boardId, workspaceId, deletedAt: null },
+    where: { id: boardId, workspaceId, deletedAt: null, isList: false },
   });
 
   if (!board) {
@@ -213,10 +216,12 @@ async function requireBoard(workspaceId: string, boardId: string) {
  * workspace y no está borrado se devuelve tal cual; si no, 409 genérico. Solo
  * se llama tras comprobar permisos de escritura. */
 function resolveExistingBoard(
-  existing: Parameters<typeof toBoardDto>[0] & { deletedAt: Date | null },
+  existing: Parameters<typeof toBoardDto>[0] & { deletedAt: Date | null; isList: boolean },
   workspaceId: string,
 ): CreatedResult<BoardDto> {
-  if (existing.workspaceId !== workspaceId || existing.deletedAt !== null) {
+  // Una lista plana (isList) no se expone por /boards, ni siquiera por un id
+  // de cliente que coincida con la suya.
+  if (existing.workspaceId !== workspaceId || existing.deletedAt !== null || existing.isList) {
     throw idAlreadyInUseError();
   }
   return { value: toBoardDto(existing), created: false };
@@ -284,7 +289,7 @@ async function listBoards(workspaceId: string, userId: string): Promise<BoardDto
   await requireMembership(workspaceId, userId);
 
   const boards = await prisma.board.findMany({
-    where: { workspaceId, deletedAt: null },
+    where: { workspaceId, deletedAt: null, isList: false },
     orderBy: { createdAt: 'asc' },
   });
 
@@ -763,7 +768,8 @@ async function moveBoards(
         requireOwnerOrAdmin(target.role);
 
         const boards = await tx.board.findMany({
-          where: { id: { in: boardIds }, workspaceId, deletedAt: null },
+          // isList: false — las listas planas no se mueven entre workspaces.
+          where: { id: { in: boardIds }, workspaceId, deletedAt: null, isList: false },
           orderBy: { createdAt: 'asc' },
         });
         if (boards.length !== boardIds.length) {
@@ -811,7 +817,7 @@ async function moveBoards(
           // updateMany con las mismas condiciones de origen: si el tablero ya se
           // movió o se borró en paralelo, no se mueve dos veces.
           const result = await tx.board.updateMany({
-            where: { id: board.id, workspaceId, deletedAt: null },
+            where: { id: board.id, workspaceId, deletedAt: null, isList: false },
             data: { workspaceId: targetWorkspaceId, slug },
           });
           if (result.count !== 1) {

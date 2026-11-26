@@ -2,11 +2,15 @@ import { randomBytes } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { env } from '../../config/env';
 import { AppError } from '../../errors/AppError';
+import { isMobileClient } from '../../middlewares/mobileClient';
 import { authService } from './auth.service';
+import type { LoginServiceResult, MobileSessionDto } from './auth.types';
 import type {
   ChangePasswordInput,
   GoogleLoginInput,
+  GoogleMobileLoginInput,
   LoginInput,
+  MobileRefreshTokenInput,
   RegenerateRecoveryCodesInput,
   RegisterInput,
   ResetPasswordWithCodeInput,
@@ -48,6 +52,52 @@ const OAUTH_STATE_COOKIE_OPTIONS = {
   maxAge: 10 * 60 * 1000, // 10 minutos — tiempo generoso para completar el login en Google
 };
 
+/** Una respuesta con refresh token en el cuerpo nunca debe quedar en una caché
+ * (navegador, proxy o CDN intermedios). */
+function noStore(res: Response) {
+  res.set('Cache-Control', 'no-store');
+  res.set('Pragma', 'no-cache');
+}
+
+/** Responde con la sesión recién emitida. Web: refresh token en cookie httpOnly
+ * y fuera del JSON. Móvil (`X-Client: mobile`): sin cookie, el refresh token y
+ * su vencimiento viajan en el JSON. `extra` añade campos (p. ej. los códigos de
+ * recuperación del primer login con Google). */
+function sendSession(
+  req: Request,
+  res: Response,
+  result: LoginServiceResult,
+  extra: Record<string, unknown> = {},
+) {
+  if (isMobileClient(req)) {
+    const body: MobileSessionDto & Record<string, unknown> = {
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+      refreshTokenExpiresAt: result.refreshTokenExpiresAt.toISOString(),
+      user: result.user,
+      ...extra,
+    };
+    noStore(res);
+    res.status(200).json(body);
+    return;
+  }
+
+  res.cookie(env.refreshTokenCookieName, result.refreshToken, {
+    ...REFRESH_TOKEN_COOKIE_OPTIONS,
+    expires: result.refreshTokenExpiresAt,
+  });
+  res.status(200).json({ accessToken: result.accessToken, user: result.user, ...extra });
+}
+
+/** Refresh token de la petición: en móvil SOLO del cuerpo (la cookie se
+ * ignora a propósito, ver middlewares/mobileClient.ts); en la web, de la cookie. */
+function readRefreshToken(req: Request): string | undefined {
+  if (isMobileClient(req)) {
+    return (req.body as MobileRefreshTokenInput | undefined)?.refreshToken;
+  }
+  return req.cookies?.[env.refreshTokenCookieName] as string | undefined;
+}
+
 async function register(req: Request, res: Response, next: NextFunction) {
   try {
     const input = req.body as RegisterInput;
@@ -86,12 +136,7 @@ async function login(req: Request, res: Response, next: NextFunction) {
       ipAddress: req.ip,
     });
 
-    res.cookie(env.refreshTokenCookieName, result.refreshToken, {
-      ...REFRESH_TOKEN_COOKIE_OPTIONS,
-      expires: result.refreshTokenExpiresAt,
-    });
-
-    res.status(200).json({ accessToken: result.accessToken, user: result.user });
+    sendSession(req, res, result);
   } catch (err) {
     next(err);
   }
@@ -127,19 +172,38 @@ async function googleLogin(req: Request, res: Response, next: NextFunction) {
       ipAddress: req.ip,
     });
 
-    res.cookie(env.refreshTokenCookieName, result.refreshToken, {
-      ...REFRESH_TOKEN_COOKIE_OPTIONS,
-      expires: result.refreshTokenExpiresAt,
-    });
-
     // recoveryCodes solo viene presente si este login creó una cuenta nueva
     // (ver auth.service.ts::loginWithGoogle) — JSON.stringify omite la clave
     // por completo cuando es undefined, así que un login normal no la trae.
-    res.status(200).json({
+    sendSession(req, res, result, { recoveryCodes: result.recoveryCodes });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Login con Google desde la app Android. Sin cookie de estado (ese nonce
+// protege el flujo de navegador): la app manda el access token de Supabase y
+// recibe la sesión en JSON. La verificación del token es exactamente la misma
+// que la del flujo web (firma por JWKS + email_verified vía la API de Supabase).
+async function googleMobileLogin(req: Request, res: Response, next: NextFunction) {
+  try {
+    const input = req.body as GoogleMobileLoginInput;
+    const result = await authService.loginWithGoogle(input, {
+      userAgent: req.get('user-agent') ?? undefined,
+      ipAddress: req.ip,
+    });
+
+    // Siempre en modo móvil (sin cookie), aunque falte la cabecera X-Client:
+    // este endpoint no tiene flujo de navegador.
+    const body: MobileSessionDto & { recoveryCodes?: string[] } = {
       accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+      refreshTokenExpiresAt: result.refreshTokenExpiresAt.toISOString(),
       user: result.user,
       recoveryCodes: result.recoveryCodes,
-    });
+    };
+    noStore(res);
+    res.status(200).json(body);
   } catch (err) {
     next(err);
   }
@@ -147,18 +211,12 @@ async function googleLogin(req: Request, res: Response, next: NextFunction) {
 
 async function refresh(req: Request, res: Response, next: NextFunction) {
   try {
-    const refreshToken = req.cookies?.[env.refreshTokenCookieName] as string | undefined;
-    const result = await authService.refreshAccessToken(refreshToken, {
+    const result = await authService.refreshAccessToken(readRefreshToken(req), {
       userAgent: req.get('user-agent') ?? undefined,
       ipAddress: req.ip,
     });
 
-    res.cookie(env.refreshTokenCookieName, result.refreshToken, {
-      ...REFRESH_TOKEN_COOKIE_OPTIONS,
-      expires: result.refreshTokenExpiresAt,
-    });
-
-    res.status(200).json({ accessToken: result.accessToken, user: result.user });
+    sendSession(req, res, result);
   } catch (err) {
     next(err);
   }
@@ -206,12 +264,7 @@ async function changePassword(req: Request, res: Response, next: NextFunction) {
       ipAddress: req.ip,
     });
 
-    res.cookie(env.refreshTokenCookieName, result.refreshToken, {
-      ...REFRESH_TOKEN_COOKIE_OPTIONS,
-      expires: result.refreshTokenExpiresAt,
-    });
-
-    res.status(200).json({ accessToken: result.accessToken, user: result.user });
+    sendSession(req, res, result);
   } catch (err) {
     next(err);
   }
@@ -230,9 +283,11 @@ async function updateProfile(req: Request, res: Response, next: NextFunction) {
 
 async function logout(req: Request, res: Response, next: NextFunction) {
   try {
-    const refreshToken = req.cookies?.[env.refreshTokenCookieName] as string | undefined;
-    await authService.logout(refreshToken);
-    res.clearCookie(env.refreshTokenCookieName, REFRESH_TOKEN_COOKIE_OPTIONS);
+    await authService.logout(readRefreshToken(req), { ipAddress: req.ip });
+    // En móvil no hay cookie que limpiar.
+    if (!isMobileClient(req)) {
+      res.clearCookie(env.refreshTokenCookieName, REFRESH_TOKEN_COOKIE_OPTIONS);
+    }
     res.status(200).json({ loggedOut: true });
   } catch (err) {
     next(err);
@@ -246,6 +301,7 @@ export const authController = {
   login,
   googleRedirect,
   googleLogin,
+  googleMobileLogin,
   refresh,
   resetPasswordWithCode,
   verifyWithRecoveryCode,

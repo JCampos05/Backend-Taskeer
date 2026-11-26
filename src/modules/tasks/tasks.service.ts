@@ -1,8 +1,14 @@
-import type { TaskPriority as PrismaTaskPriority, WorkspaceMember, WorkspaceRole } from '@prisma/client';
+import type {
+  Prisma,
+  TaskPriority as PrismaTaskPriority,
+  WorkspaceMember,
+  WorkspaceRole,
+} from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { boardsService } from '../boards/boards.service';
 import { pushNotification } from '../notifications/notifications.stream';
+import { lockWorkspaceRow } from '../../utils/workspace-lock';
 import {
   idAlreadyInUseError,
   isUniqueConstraintError,
@@ -198,6 +204,25 @@ async function notifyTaskAssigned(
   pushNotification(notification);
 }
 
+/** Toma el bloqueo del workspace y vuelve a comprobar, ya dentro de él, que la
+ * columna (y su tablero) siguen vivos. Se usa al crear o mover tareas hacia una
+ * lista plana: serializa contra deleteList (módulo lists), que borra la lista y
+ * traslada sus tareas bajo ese mismo bloqueo. */
+async function assertColumnAliveLocked(
+  tx: Prisma.TransactionClient,
+  workspaceId: string,
+  columnId: string,
+): Promise<void> {
+  await lockWorkspaceRow(tx, workspaceId);
+  const alive = await tx.column.findFirst({
+    where: { id: columnId, deletedAt: null, board: { deletedAt: null } },
+    select: { id: true },
+  });
+  if (!alive) {
+    throw new AppError(404, 'COLUMN_NOT_FOUND', 'La columna no existe.');
+  }
+}
+
 /** Creación idempotente por `id` del cliente: si ya existe en la MISMA columna
  * y no está borrada se devuelve tal cual; en cualquier otro caso (otra
  * columna, borrada, ajena) 409 genérico. Se llama solo tras comprobar permisos
@@ -231,18 +256,17 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<Creat
   await assertAssigneeIsMember(board.workspaceId, input.assigneeId);
   await assertWipLimitNotReached(column.id, column.wipLimit);
 
-  // Decisión: la siguiente posición se calcula sobre tareas no borradas —
-  // las soft-deleted no ocupan un lugar visible en la columna, así que no
-  // tiene sentido dejarles espacio en el nuevo orden.
-  const highestPosition = await prisma.task.aggregate({
-    where: { columnId: column.id, deletedAt: null },
-    _max: { position: true },
-  });
-  const nextPosition = (highestPosition._max.position ?? -1) + 1;
+  const insertTask = async (db: Prisma.TransactionClient | typeof prisma) => {
+    // Decisión: la siguiente posición se calcula sobre tareas no borradas —
+    // las soft-deleted no ocupan un lugar visible en la columna, así que no
+    // tiene sentido dejarles espacio en el nuevo orden.
+    const highestPosition = await db.task.aggregate({
+      where: { columnId: column.id, deletedAt: null },
+      _max: { position: true },
+    });
+    const nextPosition = (highestPosition._max.position ?? -1) + 1;
 
-  let task;
-  try {
-    task = await prisma.task.create({
+    return db.task.create({
       data: {
         ...(input.id ? { id: input.id } : {}),
         columnId: input.columnId,
@@ -255,6 +279,19 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<Creat
         completedAt: input.completedAt ? new Date(input.completedAt) : null,
       },
     });
+  };
+
+  let task;
+  try {
+    // En una lista plana (workspace Personal) se crea bajo el mismo bloqueo
+    // que usa /lists: si la lista se está borrando en paralelo, la tarea no
+    // puede quedar viva en una lista ya borrada.
+    task = board.isList
+      ? await prisma.$transaction(async (tx) => {
+          await assertColumnAliveLocked(tx, board.workspaceId, column.id);
+          return insertTask(tx);
+        })
+      : await insertTask(prisma);
   } catch (err) {
     // Dos creaciones simultáneas con el mismo id: la segunda pierde la
     // carrera y se resuelve como reintento idempotente.
@@ -397,6 +434,12 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
   }
 
   const updatedTask = await prisma.$transaction(async (tx) => {
+    // Hacia una lista plana: mismo bloqueo que /lists, para que borrar la
+    // lista en paralelo no deje esta tarea viva en una lista ya borrada.
+    if (!isSameColumn && destinationBoard.isList) {
+      await assertColumnAliveLocked(tx, destinationBoard.workspaceId, destinationColumn.id);
+    }
+
     if (isSameColumn) {
       const siblings = await tx.task.findMany({
         where: { columnId: sourceColumn.id, deletedAt: null },

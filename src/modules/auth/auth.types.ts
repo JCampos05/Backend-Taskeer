@@ -43,6 +43,14 @@ export interface LoginResultDto {
   user: PublicUserDto;
 }
 
+// Respuesta de login/refresh/cambio de contraseña/Google para el cliente
+// móvil (`X-Client: mobile`): sin cookie, el refresh token viaja en el JSON.
+export interface MobileSessionDto extends LoginResultDto {
+  refreshToken: string;
+  // ISO 8601 UTC.
+  refreshTokenExpiresAt: string;
+}
+
 // Resultado interno del service — incluye el refresh token en texto plano y
 // su expiración, que el controller usa para setear la cookie httpOnly. Nunca
 // se serializa completo como respuesta JSON (eso sería exponer el refresh

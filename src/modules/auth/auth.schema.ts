@@ -93,6 +93,27 @@ export const googleLoginSchema = z.object({
   }),
 });
 
+// Refresh token en el cuerpo — solo para el cliente móvil (cabecera
+// `X-Client: mobile`), que no usa cookies. El token real mide 64 caracteres
+// hex; el tope evita cuerpos absurdos antes de hashearlo.
+export const mobileRefreshTokenSchema = z.object({
+  body: z.object({
+    refreshToken: z.string().min(1, 'Falta el refresh token.').max(256, 'El refresh token no es válido.'),
+  }),
+});
+
+// Login con Google desde la app: ella obtiene la sesión de Supabase y manda
+// aquí su access token. Sin `state`: ese nonce protege el flujo de navegador
+// (cookie de CSRF), que la app no usa.
+export const googleMobileLoginSchema = z.object({
+  body: z.object({
+    supabaseAccessToken: z
+      .string()
+      .min(1, 'Falta el token de Supabase.')
+      .max(4096, 'El token de Supabase no es válido.'),
+  }),
+});
+
 export const updateProfileSchema = z.object({
   body: z.object({
     displayName: z
@@ -104,6 +125,8 @@ export const updateProfileSchema = z.object({
 });
 
 export type GoogleLoginInput = z.infer<typeof googleLoginSchema>['body'];
+export type GoogleMobileLoginInput = z.infer<typeof googleMobileLoginSchema>['body'];
+export type MobileRefreshTokenInput = z.infer<typeof mobileRefreshTokenSchema>['body'];
 export type RegisterInput = z.infer<typeof registerSchema>['body'];
 export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>['query'];
 export type LoginInput = z.infer<typeof loginSchema>['body'];

@@ -7,6 +7,7 @@ import { env } from '../../config/env';
 import { AppError } from '../../errors/AppError';
 import { mailService } from '../../services/mail/mail.service';
 import { pushNotification } from '../notifications/notifications.stream';
+import { createPersonalWorkspace } from '../workspaces/personal-workspace';
 import type {
   ChangePasswordInput,
   GoogleLoginInput,
@@ -142,6 +143,10 @@ async function register(input: RegisterInput): Promise<RegisterResultDto> {
       await tx.recoveryCode.createMany({
         data: recoveryCodes.map((rc) => ({ userId: createdUser.id, codeHash: rc.hash })),
       });
+
+      // Workspace "Personal": alberga las listas y tableros propios (y los de
+      // la app móvil). Misma transacción: nadie existe sin él.
+      await createPersonalWorkspace(tx, createdUser.id);
 
       return createdUser;
     });
@@ -479,7 +484,9 @@ function isUniqueConstraintViolation(err: unknown): boolean {
 }
 
 async function loginWithGoogle(
-  input: GoogleLoginInput,
+  // Solo usa el access token de Supabase: el `state` del flujo web lo valida
+  // el controlador contra su cookie, y la app móvil no lo tiene.
+  input: Pick<GoogleLoginInput, 'supabaseAccessToken'>,
   context: { userAgent?: string; ipAddress?: string },
 ): Promise<GoogleLoginServiceResult> {
   const payload = await verifySupabaseAccessToken(input.supabaseAccessToken);
@@ -621,6 +628,8 @@ async function loginWithGoogle(
       await tx.recoveryCode.createMany({
         data: recoveryCodes.map((rc) => ({ userId: createdUser.id, codeHash: rc.hash })),
       });
+
+      await createPersonalWorkspace(tx, createdUser.id);
 
       await tx.auditLog.create({
         data: {
@@ -986,7 +995,10 @@ async function changePassword(
   );
 }
 
-async function logout(refreshTokenPlain: string | undefined): Promise<void> {
+async function logout(
+  refreshTokenPlain: string | undefined,
+  context: { ipAddress?: string } = {},
+): Promise<void> {
   if (!refreshTokenPlain) {
     return;
   }
@@ -1004,7 +1016,7 @@ async function logout(refreshTokenPlain: string | undefined): Promise<void> {
       data: { revokedAt: new Date() },
     }),
     prisma.auditLog.create({
-      data: { userId: refreshToken.userId, action: 'auth.logout' },
+      data: { userId: refreshToken.userId, action: 'auth.logout', ipAddress: context.ipAddress },
     }),
   ]);
 }

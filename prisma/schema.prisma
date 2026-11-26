@@ -330,6 +330,12 @@ model Workspace {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
+  // Workspace "Personal" que cada usuario recibe al registrarse (único por
+  // usuario, solo él es miembro). Aloja sus tableros propios y las listas
+  // planas / bandeja de la app móvil (Board.isList). No cuenta contra el
+  // límite de workspaces del plan y no se puede borrar, transferir ni invitar
+  // a otras personas.
+  isPersonal  Boolean   @default(false)
 
   members     WorkspaceMember[]
   boards      Board[]
@@ -388,6 +394,12 @@ model Board {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   deletedAt   DateTime?
+  // Lista plana de la app móvil (incluida la bandeja "Tareas"): un tablero
+  // OCULTO de una sola columna dentro del workspace personal. No aparece en
+  // los listados de tableros de la web y solo se gestiona por /lists, nunca
+  // por los endpoints de tableros/columnas. `listPosition` ordena las listas.
+  isList       Boolean  @default(false)
+  listPosition Int      @default(0)
 
   workspace       Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   columns         Column[]
@@ -397,6 +409,9 @@ model Board {
   // tipo /w/mi-equipo/b/sprint-actual sin coordinar slugs entre workspaces distintos.
   @@unique([workspaceId, slug])
   @@index([workspaceId])
+  // Listado y orden de listas planas (y, con isList = false, de tableros
+  // normales) de un workspace.
+  @@index([workspaceId, isList, listPosition])
   @@map("boards")
 }
 
