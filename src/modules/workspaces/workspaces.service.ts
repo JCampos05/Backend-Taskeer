@@ -1,4 +1,5 @@
 import { randomBytes, createHash } from 'node:crypto';
+import { buildWorkspaceRevocationEvents, recordWorkspaceGrant } from '../../utils/access-events';
 import type { InvitationStatus, WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
@@ -436,18 +437,35 @@ async function removeMember(
     requireOwnerOrAdmin(actingMembership);
   }
 
-  await prisma.$transaction([
-    prisma.workspaceMember.delete({
+  await prisma.$transaction(async (tx) => {
+    // Sync móvil: quien sale o es expulsado debe poder retirar el workspace y sus
+    // tableros de su app; la fila de miembro se borra y no deja otro rastro. Se
+    // calcula dentro de la transacción para no perder un tablero creado en medio.
+    const revocationEvents = await buildWorkspaceRevocationEvents(
+      tx,
+      targetUserId,
+      workspaceId,
+      targetMembership.role,
+    );
+
+    await tx.workspaceMember.delete({
       where: { workspaceId_userId: { workspaceId, userId: targetUserId } },
-    }),
-    prisma.auditLog.create({
+    });
+    // Los overrides de rol por tablero no sobreviven a la membresía: si la
+    // persona vuelve (p. ej. como VIEWER), un override viejo a ADMIN le daría
+    // de vuelta un rol que ya no le corresponde.
+    await tx.boardMemberOverride.deleteMany({
+      where: { userId: targetUserId, board: { workspaceId } },
+    });
+    await tx.accessEvent.createMany({ data: revocationEvents });
+    await tx.auditLog.create({
       data: {
         userId: actingUserId,
         action: 'workspace.member_removed',
         metadata: { workspaceId, targetUserId, selfRemoval: isSelfRemoval },
       },
-    }),
-  ]);
+    });
+  });
 }
 
 async function transferOwnership(
@@ -912,6 +930,8 @@ async function approveInvitation(
       data: [{ workspaceId, userId: invitee.id, role: invitation.role }],
       skipDuplicates: true,
     });
+    // Sync móvil: el invitado gana acceso a todo el workspace.
+    await recordWorkspaceGrant(tx, invitee.id, workspaceId);
 
     await tx.auditLog.create({
       data: {

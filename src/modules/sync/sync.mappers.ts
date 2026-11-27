@@ -1,4 +1,5 @@
 import type {
+  SyncBoardAccessDto,
   SyncBoardDto,
   SyncColumnDto,
   SyncListDto,
@@ -88,6 +89,8 @@ export function toSyncWorkspaceDto(
   workspace: { id: string; name: string; isPersonal: boolean; updatedAt: Date; deletedAt: Date | null },
   myRole: string,
 ): SyncWorkspaceDto {
+  // `updatedAt` ya viene calculado por quien llama: el mayor entre el del
+  // workspace y el de la membresía del usuario (un cambio de rol también cuenta).
   return {
     id: workspace.id,
     name: workspace.name,
@@ -201,5 +204,21 @@ export function toSyncReminderDto(reminder: {
     createdAt: iso(reminder.createdAt),
     updatedAt: iso(reminder.updatedAt),
     deletedAt: isoOrNull(reminder.deletedAt),
+  };
+}
+
+export function toSyncBoardAccessDto(access: {
+  boardId: string;
+  workspaceId: string;
+  effectiveRole: string;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncBoardAccessDto {
+  return {
+    boardId: access.boardId,
+    workspaceId: access.workspaceId,
+    effectiveRole: access.effectiveRole,
+    updatedAt: iso(access.updatedAt),
+    deletedAt: isoOrNull(access.deletedAt),
   };
 }

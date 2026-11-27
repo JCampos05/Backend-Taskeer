@@ -1,7 +1,6 @@
 import { prisma } from '../../config/prisma';
 import { tasksService } from '../tasks/tasks.service';
 import type { UpdateSubtaskInput } from '../tasks/tasks.schema';
-import { ensurePersonalWorkspace } from '../workspaces/personal-workspace';
 import { toSyncSubtaskDto } from './sync.mappers';
 import {
   applied,
@@ -9,6 +8,7 @@ import {
   conflict,
   decide,
   invalid,
+  memberWorkspaceIds,
   rejected,
   sameDate,
   type Outcome,
@@ -23,12 +23,12 @@ export async function subtaskMutation(
   m: SyncMutationInput,
   now: number,
 ): Promise<Outcome> {
-  const personal = await ensurePersonalWorkspace(prisma, userId);
+  const memberOf = await memberWorkspaceIds(userId);
   const current = await prisma.subtask.findUnique({
     where: { id: m.id },
     include: { task: { select: { column: { select: { board: { select: { workspaceId: true } } } } } } },
   });
-  const mine = current !== null && current.task.column.board.workspaceId === personal.id;
+  const mine = current !== null && memberOf.has(current.task.column.board.workspaceId);
   if (current && !mine) {
     return m.op === 'delete'
       ? applied(null)
@@ -51,12 +51,12 @@ export async function subtaskMutation(
   const data: SubtaskData = parsed.data;
 
   if (!current) {
-    // La tarea padre debe ser una tarea VIVA de mi workspace Personal.
+    // La tarea padre debe ser una tarea VIVA de un workspace donde soy miembro.
     const task = await prisma.task.findFirst({
       where: {
         id: data.taskId,
         deletedAt: null,
-        column: { board: { workspaceId: personal.id, deletedAt: null } },
+        column: { board: { workspaceId: { in: [...memberOf] }, deletedAt: null } },
       },
       select: { id: true },
     });

@@ -83,40 +83,35 @@ export async function bestEffort(step: () => Promise<unknown>): Promise<void> {
   }
 }
 
-/** La tarea sobre la que cuelga una marca de Mi día o un recordatorio: debe ser
- * una tarea VIVA de mi workspace Personal. Si es de un workspace compartido al
- * que pertenezco, el rechazo NO se guarda (llega con H5); si no existe o no la
- * veo, DEPENDENCY_NOT_FOUND. Devuelve null cuando la tarea es válida. */
-export async function checkOwnTask(
-  userId: string,
-  personalId: string,
-  taskId: string,
-): Promise<Outcome | null> {
-  const own = await prisma.task.findFirst({
-    where: {
-      id: taskId,
-      deletedAt: null,
-      column: { board: { workspaceId: personalId, deletedAt: null } },
-    },
-    select: { id: true },
+/** Ids de los workspaces VIVOS donde el usuario es miembro. Es el límite de
+ * visibilidad de la sync: un id de tablero, columna, tarea o subtarea que
+ * pertenezca a otro workspace se trata como ajeno (nunca se revela). Los
+ * permisos de ESCRITURA (rol) los siguen aplicando los services. */
+export async function memberWorkspaceIds(userId: string): Promise<Set<string>> {
+  const memberships = await prisma.workspaceMember.findMany({
+    where: { userId, workspace: { deletedAt: null } },
+    select: { workspaceId: true },
   });
-  if (own) return null;
+  return new Set(memberships.map((m) => m.workspaceId));
+}
 
-  const shared = await prisma.task.findFirst({
+/** La tarea sobre la que cuelga una marca de Mi día o un recordatorio: debe ser
+ * una tarea VIVA de un tablero vivo de un workspace donde soy miembro. Si no
+ * existe o no la veo, DEPENDENCY_NOT_FOUND. Devuelve null cuando es válida. */
+export async function checkVisibleTask(userId: string, taskId: string): Promise<Outcome | null> {
+  const task = await prisma.task.findFirst({
     where: {
       id: taskId,
       deletedAt: null,
-      column: { board: { workspace: { members: { some: { userId } } } } },
+      column: {
+        deletedAt: null,
+        board: {
+          deletedAt: null,
+          workspace: { deletedAt: null, members: { some: { userId } } },
+        },
+      },
     },
     select: { id: true },
   });
-  if (shared) {
-    return rejected(
-      'INVALID_MUTATION',
-      'Las tareas de workspaces compartidos todavía no se pueden sincronizar.',
-      null,
-      false,
-    );
-  }
-  return rejected('DEPENDENCY_NOT_FOUND', 'La tarea no existe.');
+  return task ? null : rejected('DEPENDENCY_NOT_FOUND', 'La tarea no existe.');
 }

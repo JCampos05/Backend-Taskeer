@@ -68,6 +68,17 @@ export interface SyncWorkspaceDto {
   deletedAt: string | null;
 }
 
+export interface SyncBoardAccessDto {
+  /** Un registro por tablero normal visible. Sin `id`: la clave es `boardId`. */
+  boardId: string;
+  workspaceId: string;
+  /** Rol ya resuelto (override del tablero o, si no hay, el del workspace). */
+  effectiveRole: string;
+  updatedAt: string;
+  /** No nulo = el usuario dejó de ver el tablero: la app lo retira con su contenido. */
+  deletedAt: string | null;
+}
+
 export interface SyncBoardDto {
   id: string;
   workspaceId: string;
@@ -127,7 +138,7 @@ export interface SyncReminderDto {
 
 export interface SyncChanges {
   workspaces: SyncWorkspaceDto[];
-  boardAccess: unknown[];
+  boardAccess: SyncBoardAccessDto[];
   boards: SyncBoardDto[];
   lists: SyncListDto[];
   columns: SyncColumnDto[];

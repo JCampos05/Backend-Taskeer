@@ -10,14 +10,16 @@ import {
   conflict,
   decide,
   invalid,
+  memberWorkspaceIds,
   rejected,
   sameDate,
   type Outcome,
 } from './sync.push.shared';
 import { taskDataSchema, type SyncMutationInput, type TaskData } from './sync.schema';
 
-// Mutaciones de `task` (contrato §5.4). H2: tareas de listas planas Y de
-// tableros del workspace Personal. Los workspaces compartidos llegan con H5.
+// Mutaciones de `task` (contrato §5.4): tareas de listas planas (workspace
+// Personal) y de tableros de cualquier workspace donde soy miembro. Mover entre
+// workspaces lo rechaza el service con CROSS_WORKSPACE_MOVE.
 
 const TASK_INCLUDE = {
   column: {
@@ -35,11 +37,11 @@ interface Target {
 }
 
 /** Columna destino de la tarea: la interna de una lista viva mía (`listId`) o
- * una columna viva de un tablero normal vivo de mi workspace Personal
- * (`columnId`). Devuelve un `Outcome` de rechazo si no se puede resolver. */
+ * una columna viva de un tablero normal vivo de un workspace donde soy miembro
+ * (`columnId`; el rol lo comprueba el service). Devuelve un `Outcome` de rechazo si no se puede resolver. */
 async function resolveTarget(
-  userId: string,
   personalId: string,
+  memberOf: Set<string>,
   data: TaskData,
 ): Promise<Target | Outcome> {
   if (data.listId !== null) {
@@ -56,29 +58,11 @@ async function resolveTarget(
     where: {
       id: data.columnId!,
       deletedAt: null,
-      board: { workspaceId: personalId, isList: false, deletedAt: null },
+      board: { workspaceId: { in: [...memberOf] }, isList: false, deletedAt: null },
     },
     select: { id: true },
   });
   if (column) return { columnId: column.id };
-
-  // ¿Es una columna de un workspace compartido al que pertenezco? Esas tareas
-  // llegan con H5: no se guarda el rechazo para poder reenviarlas entonces.
-  const shared = await prisma.column.findFirst({
-    where: {
-      id: data.columnId!,
-      board: { workspace: { members: { some: { userId } } } },
-    },
-    select: { id: true },
-  });
-  if (shared) {
-    return rejected(
-      'INVALID_MUTATION',
-      'Las tareas de workspaces compartidos todavía no se pueden sincronizar.',
-      null,
-      false,
-    );
-  }
   return rejected('DEPENDENCY_NOT_FOUND', 'La columna de la tarea no existe.');
 }
 
@@ -88,10 +72,11 @@ export async function taskMutation(
   now: number,
 ): Promise<Outcome> {
   const personal = await ensurePersonalWorkspace(prisma, userId);
+  const memberOf = await memberWorkspaceIds(userId);
   const current = await prisma.task.findUnique({ where: { id: m.id }, include: TASK_INCLUDE });
-  // Un id que existe pero no es una tarea de mi workspace Personal se trata como
-  // ajeno: nunca se revela qué es ni de quién.
-  const mine = current !== null && current.column.board.workspaceId === personal.id;
+  // Un id que existe pero no es una tarea de un workspace donde soy miembro se
+  // trata como ajeno: nunca se revela qué es ni de quién.
+  const mine = current !== null && memberOf.has(current.column.board.workspaceId);
   if (current && !mine) {
     return m.op === 'delete'
       ? applied(null)
@@ -117,7 +102,7 @@ export async function taskMutation(
   // cliente debe enterarse de que la tarea ya no existe).
   if (current?.deletedAt) return conflict(toDto(current));
 
-  const target = await resolveTarget(userId, personal.id, data);
+  const target = await resolveTarget(personal.id, memberOf, data);
   if ('status' in target) return target;
   const { columnId } = target;
 

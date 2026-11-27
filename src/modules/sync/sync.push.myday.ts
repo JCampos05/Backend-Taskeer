@@ -1,9 +1,8 @@
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { tasksService } from '../tasks/tasks.service';
-import { ensurePersonalWorkspace } from '../workspaces/personal-workspace';
 import { toSyncMyDayDto } from './sync.mappers';
-import { applied, checkOwnTask, invalid, type Outcome } from './sync.push.shared';
+import { applied, checkVisibleTask, invalid, type Outcome } from './sync.push.shared';
 import { myDayDataSchema, type SyncMutationInput } from './sync.schema';
 
 // Mutaciones de `myDay` (contrato §5.4 y §5.5). El `id` ES el taskId: una marca
@@ -17,7 +16,6 @@ export async function myDayMutation(
   m: SyncMutationInput,
   now: number,
 ): Promise<Outcome> {
-  const personal = await ensurePersonalWorkspace(prisma, userId);
   const where = { userId_taskId: { userId, taskId: m.id } };
   const mark = await prisma.myDayTask.findUnique({ where });
   const reread = async () => toSyncMyDayDto(await prisma.myDayTask.findUniqueOrThrow({ where }));
@@ -42,7 +40,7 @@ export async function myDayMutation(
   const parsed = myDayDataSchema.safeParse(m.data);
   if (!parsed.success) return invalid('Los datos de Mi día no son válidos.');
 
-  const taskProblem = await checkOwnTask(userId, personal.id, m.id);
+  const taskProblem = await checkVisibleTask(userId, m.id);
   if (taskProblem) return taskProblem;
 
   // Un `addedAt` en el futuro se acota a la hora del servidor.

@@ -1,6 +1,5 @@
 import { prisma } from '../../config/prisma';
 import { boardsService } from '../boards/boards.service';
-import { ensurePersonalWorkspace } from '../workspaces/personal-workspace';
 import { toSyncBoardDto, toSyncColumnDto } from './sync.mappers';
 import {
   applied,
@@ -8,6 +7,7 @@ import {
   conflict,
   decide,
   invalid,
+  memberWorkspaceIds,
   rejected,
   type Outcome,
 } from './sync.push.shared';
@@ -19,9 +19,9 @@ import {
   type SyncMutationInput,
 } from './sync.schema';
 
-// Mutaciones de `board` y `column` (contrato §5.4). H2: solo tableros del
-// workspace Personal (los compartidos llegan con H5). Todo pasa por
-// boardsService: mismos permisos y reglas que la API normal.
+// Mutaciones de `board` y `column` (contrato §5.4): tableros de cualquier
+// workspace donde soy miembro. Todo pasa por boardsService, que aplica los
+// mismos permisos y reglas que la API normal (solo OWNER/ADMIN gestionan).
 
 // ---------------------------------------------------------------------------
 // board
@@ -32,11 +32,11 @@ export async function boardMutation(
   m: SyncMutationInput,
   now: number,
 ): Promise<Outcome> {
-  const personal = await ensurePersonalWorkspace(prisma, userId);
+  const memberOf = await memberWorkspaceIds(userId);
   const current = await prisma.board.findUnique({ where: { id: m.id } });
-  // Un id que existe pero no es un tablero normal mío es ajeno (incluye las
-  // listas: se gestionan solo como entidad `list`).
-  const mine = current !== null && !current.isList && current.workspaceId === personal.id;
+  // Un id que existe pero no es un tablero normal de un workspace donde soy
+  // miembro es ajeno (incluye las listas: se gestionan solo como `list`).
+  const mine = current !== null && !current.isList && memberOf.has(current.workspaceId);
   if (current && !mine) {
     return m.op === 'delete'
       ? applied(null)
@@ -50,7 +50,7 @@ export async function boardMutation(
     if (!current) return applied(null);
     if (current.deletedAt) return applied(toSyncBoardDto(current));
     if (decide(current, m, now) === 'conflict') return conflict(toSyncBoardDto(current));
-    await boardsService.deleteBoard(personal.id, m.id, userId);
+    await boardsService.deleteBoard(current.workspaceId, m.id, userId);
     return applied(await reread());
   }
 
@@ -59,17 +59,12 @@ export async function boardMutation(
   const data: BoardData = parsed.data;
 
   if (!current) {
-    // El workspace de un tablero nuevo solo puede ser el Personal por ahora. No
-    // se guarda el rechazo para poder reenviarlo cuando H5 lo permita.
-    if (data.workspaceId !== personal.id) {
-      return rejected(
-        'INVALID_MUTATION',
-        'Solo se pueden crear tableros en tu workspace personal por ahora.',
-        null,
-        false,
-      );
+    // El workspace del tablero nuevo debe ser uno donde soy miembro (el rol
+    // OWNER/ADMIN lo exige el service: FORBIDDEN si no).
+    if (!memberOf.has(data.workspaceId)) {
+      return rejected('DEPENDENCY_NOT_FOUND', 'El workspace del tablero no existe.');
     }
-    await boardsService.createBoard(personal.id, userId, {
+    await boardsService.createBoard(data.workspaceId, userId, {
       id: m.id,
       name: data.name,
       columns: data.columns?.map((c) => ({
@@ -97,7 +92,7 @@ export async function boardMutation(
   if (current.name === data.name) return applied(toSyncBoardDto(current));
   if (decide(current, m, now) === 'conflict') return conflict(toSyncBoardDto(current));
 
-  await boardsService.updateBoard(personal.id, m.id, userId, { name: data.name });
+  await boardsService.updateBoard(current.workspaceId, m.id, userId, { name: data.name });
   return applied(await reread());
 }
 
@@ -110,14 +105,14 @@ export async function columnMutation(
   m: SyncMutationInput,
   now: number,
 ): Promise<Outcome> {
-  const personal = await ensurePersonalWorkspace(prisma, userId);
+  const memberOf = await memberWorkspaceIds(userId);
   const current = await prisma.column.findUnique({
     where: { id: m.id },
     include: { board: { select: { workspaceId: true, isList: true } } },
   });
   // La columna interna de una lista nunca es visible como `column`.
   const mine =
-    current !== null && !current.board.isList && current.board.workspaceId === personal.id;
+    current !== null && !current.board.isList && memberOf.has(current.board.workspaceId);
   if (current && !mine) {
     return m.op === 'delete'
       ? applied(null)
@@ -132,7 +127,7 @@ export async function columnMutation(
     if (current.deletedAt) return applied(toSyncColumnDto(current));
     if (decide(current, m, now) === 'conflict') return conflict(toSyncColumnDto(current));
     try {
-      await boardsService.deleteColumn(personal.id, current.boardId, m.id, userId);
+      await boardsService.deleteColumn(current.board.workspaceId, current.boardId, m.id, userId);
     } catch (err) {
       // COLUMN_NOT_EMPTY: se devuelve la columna vigente para que el cliente la adopte.
       if (isColumnNotEmpty(err)) {
@@ -148,14 +143,19 @@ export async function columnMutation(
   const data: ColumnData = parsed.data;
 
   if (!current) {
-    // El tablero debe ser un tablero normal vivo del Personal.
+    // El tablero debe ser un tablero normal vivo de un workspace donde soy miembro.
     const board = await prisma.board.findFirst({
-      where: { id: data.boardId, workspaceId: personal.id, isList: false, deletedAt: null },
-      select: { id: true },
+      where: {
+        id: data.boardId,
+        workspaceId: { in: [...memberOf] },
+        isList: false,
+        deletedAt: null,
+      },
+      select: { id: true, workspaceId: true },
     });
     if (!board) return rejected('DEPENDENCY_NOT_FOUND', 'El tablero de la columna no existe.');
 
-    const created = await boardsService.createColumn(personal.id, board.id, userId, {
+    const created = await boardsService.createColumn(board.workspaceId, board.id, userId, {
       id: m.id,
       name: data.name,
       wipLimit: data.wipLimit,
@@ -164,7 +164,9 @@ export async function columnMutation(
     // createColumn añade al final; si el cliente pidió otra posición se reordena.
     if (created.value.position !== data.position) {
       await bestEffort(() =>
-        boardsService.updateColumn(personal.id, board.id, m.id, userId, { position: data.position }),
+        boardsService.updateColumn(board.workspaceId, board.id, m.id, userId, {
+          position: data.position,
+        }),
       );
     }
     return applied(await reread());
@@ -184,7 +186,7 @@ export async function columnMutation(
   if (same) return applied(toSyncColumnDto(current));
   if (decide(current, m, now) === 'conflict') return conflict(toSyncColumnDto(current));
 
-  await boardsService.updateColumn(personal.id, current.boardId, m.id, userId, {
+  await boardsService.updateColumn(current.board.workspaceId, current.boardId, m.id, userId, {
     ...(current.name !== data.name ? { name: data.name } : {}),
     ...(current.position !== data.position ? { position: data.position } : {}),
     ...(current.wipLimit !== data.wipLimit ? { wipLimit: data.wipLimit } : {}),

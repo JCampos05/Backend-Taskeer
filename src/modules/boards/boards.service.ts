@@ -706,6 +706,14 @@ async function removeBoardMemberOverride(
   // rol" que setBoardMemberOverride arriba.
   await prisma.$transaction([
     prisma.boardMemberOverride.deleteMany({ where: { boardId, userId: targetUserId } }),
+    // Sync móvil: quitar un override no deja fila con updatedAt nuevo, pero el
+    // rol efectivo cambia. Se toca la membresía para que `boardAccess` se
+    // vuelva a emitir (updateMany con fecha explícita: un update vacío no
+    // garantiza subir @updatedAt).
+    prisma.workspaceMember.updateMany({
+      where: { workspaceId, userId: targetUserId },
+      data: { updatedAt: new Date() },
+    }),
     prisma.auditLog.create({
       data: {
         userId,
@@ -817,6 +825,11 @@ async function moveBoards(
           })
         ).map((m) => m.userId);
 
+        const sourceMembers = await tx.workspaceMember.findMany({
+          where: { workspaceId },
+          select: { userId: true, role: true },
+        });
+
         const moved: BoardDto[] = [];
         let tasksUnassigned = 0;
         let subtasksUnassigned = 0;
@@ -852,6 +865,32 @@ async function moveBoards(
           if (result.count !== 1) {
             throw new AppError(404, 'BOARD_NOT_FOUND', 'El board no existe.');
           }
+
+          // Sync móvil: quien estaba en el origen y no está en el destino pierde
+          // el tablero; los del destino que NO venían del origen lo ganan (fuerza
+          // snapshot). Quien ya era miembro del origen no lo necesita: el tablero
+          // le llega incremental, con `updatedAt` nuevo.
+          await tx.accessEvent.createMany({
+            data: [
+              ...sourceMembers
+                .filter((m) => !targetMemberIds.includes(m.userId))
+                .map((m) => ({
+                  userId: m.userId,
+                  workspaceId,
+                  boardId: board.id,
+                  kind: 'REVOKED' as const,
+                  role: m.role,
+                })),
+              ...targetMemberIds
+                .filter((memberId) => !sourceMembers.some((m) => m.userId === memberId))
+                .map((memberId) => ({
+                userId: memberId,
+                workspaceId: targetWorkspaceId,
+                boardId: board.id,
+                kind: 'GRANTED' as const,
+              })),
+            ],
+          });
 
           const tasks = await tx.task.updateMany({
             where: {

@@ -1,11 +1,11 @@
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { remindersService } from '../reminders/reminders.service';
-import { ensurePersonalWorkspace } from '../workspaces/personal-workspace';
 import { toSyncReminderDto } from './sync.mappers';
 import {
   applied,
-  checkOwnTask,
+  checkVisibleTask,
+  memberWorkspaceIds,
   conflict,
   decide,
   invalid,
@@ -25,20 +25,21 @@ export async function reminderMutation(
   m: SyncMutationInput,
   now: number,
 ): Promise<Outcome> {
-  const personal = await ensurePersonalWorkspace(prisma, userId);
+  const memberOf = await memberWorkspaceIds(userId);
   const current = await prisma.reminder.findUnique({
     where: { id: m.id },
     include: {
       task: { select: { column: { select: { board: { select: { workspaceId: true } } } } } },
     },
   });
-  // Solo es mío un recordatorio MOBILE que yo creé sobre una tarea de mi
-  // Personal; cualquier otro id existente es ajeno y no se revela.
+  // Solo es mío un recordatorio MOBILE que yo creé sobre una tarea de un
+  // workspace donde sigo siendo miembro; cualquier otro id existente es ajeno y
+  // no se revela.
   const mine =
     current !== null &&
     current.origin === 'MOBILE' &&
     current.createdById === userId &&
-    current.task.column.board.workspaceId === personal.id;
+    memberOf.has(current.task.column.board.workspaceId);
   if (current && !mine) {
     return m.op === 'delete'
       ? applied(null)
@@ -76,7 +77,7 @@ export async function reminderMutation(
   };
 
   if (!current) {
-    const taskProblem = await checkOwnTask(userId, personal.id, data.taskId);
+    const taskProblem = await checkVisibleTask(userId, data.taskId);
     if (taskProblem) return taskProblem;
     await remindersService.createMobileReminder(data.taskId, userId, { id: m.id, ...input });
     return applied(await reread());

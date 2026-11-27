@@ -28,6 +28,7 @@ import {
 
 // Las mutaciones procesadas se conservan para reenvíos ≥ 30 días (§5.2).
 const MUTATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const ACCESS_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const PURGE_EVERY_MS = 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,10 @@ function maybePurge(): void {
   lastPurge = now;
   void prisma.syncMutation
     .deleteMany({ where: { createdAt: { lt: new Date(now - MUTATION_RETENTION_MS) } } })
+    .catch(() => undefined);
+  // Los eventos de acceso viven tanto como el cursor de sync (90 días).
+  void prisma.accessEvent
+    .deleteMany({ where: { createdAt: { lt: new Date(now - ACCESS_EVENT_RETENTION_MS) } } })
     .catch(() => undefined);
 }
 

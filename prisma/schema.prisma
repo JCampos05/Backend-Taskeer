@@ -44,6 +44,15 @@ enum ReminderStatus {
   DISMISSED
 }
 
+// Cambio de acceso de un usuario a un workspace/tablero que la sync móvil no
+// puede deducir de las filas vivas: GRANTED (ganó acceso; fuerza un snapshot
+// completo para que reaparezca el contenido viejo) y REVOKED (lo perdió; se
+// emite como tombstone de `workspaces`/`boardAccess`).
+enum AccessEventKind {
+  GRANTED
+  REVOKED
+}
+
 enum SyncMutationStatus {
   APPLIED
   CONFLICT
@@ -163,6 +172,7 @@ model User {
   attachments        Attachment[]
   myDayTasks         MyDayTask[]
   syncMutations      SyncMutation[]
+  accessEvents       AccessEvent[]
   createdReminders   Reminder[]            @relation("ReminderCreator")
 
   @@map("users")
@@ -352,10 +362,11 @@ model Workspace {
   // a otras personas.
   isPersonal Boolean   @default(false)
 
-  members     WorkspaceMember[]
-  boards      Board[]
-  invitations Invitation[]
-  attachments Attachment[]
+  members      WorkspaceMember[]
+  boards       Board[]
+  invitations  Invitation[]
+  accessEvents AccessEvent[]
+  attachments  Attachment[]
 
   @@index([ownerId])
   @@map("workspaces")
@@ -426,6 +437,7 @@ model Board {
   workspace       Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   columns         Column[]
   memberOverrides BoardMemberOverride[]
+  accessEvents    AccessEvent[]
 
   // El slug es único dentro de su workspace, no globalmente — permite URLs
   // tipo /w/mi-equipo/b/sprint-actual sin coordinar slugs entre workspaces distintos.
@@ -826,4 +838,29 @@ model SyncMutation {
   @@unique([userId, clientMutationId])
   @@index([createdAt])
   @@map("sync_mutations")
+}
+
+// Registro de pérdidas y ganancias de acceso, escrito por los services que
+// agregan o expulsan miembros y mueven tableros. Solo lo lee la sync móvil.
+// `boardId` nulo = el evento es del workspace entero. Se purga a los 90 días
+// (la vida del cursor de sync). `role` = rol que tenía quien pierde acceso.
+model AccessEvent {
+  id          String          @id @default(uuid()) @db.Char(36)
+  userId      String          @db.Char(36)
+  workspaceId String          @db.Char(36)
+  boardId     String?         @db.Char(36)
+  kind        AccessEventKind
+  role        WorkspaceRole?
+  createdAt   DateTime        @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // Cascade (no SetNull) a propósito: boardId nulo significa "evento del workspace
+  // entero"; con SetNull, borrar un tablero convertiría su evento en uno del
+  // workspace y la app retiraría de más.
+  board     Board?    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind, createdAt])
+  @@index([createdAt])
+  @@map("access_events")
 }
