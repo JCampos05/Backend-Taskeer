@@ -32,6 +32,34 @@ export const createBoardSchema = z.object({
       .trim()
       .min(2, 'El nombre debe tener al menos 2 caracteres.')
       .max(150, 'El nombre es demasiado largo.'),
+    // Solo para clientes offline-first: siembra ESTAS columnas (con los ids que
+    // el cliente ya generó) en vez de las predefinidas. Se ordenan por
+    // `position` y se renumeran 0..n-1. Sin esto, el comportamiento de siempre.
+    columns: z
+      .array(
+        z.object({
+          id: clientId,
+          name: z
+            .string()
+            .trim()
+            .min(1, 'El nombre de la columna es obligatorio.')
+            .max(100, 'El nombre de la columna es demasiado largo.'),
+          position: z.number().int('La posición debe ser un entero.').min(0),
+          wipLimit: z
+            .number()
+            .int('El límite debe ser un entero.')
+            .min(1, 'El límite debe ser mayor a 0.')
+            .nullable()
+            .optional(),
+          isDoneColumn: z.boolean().optional(),
+        }),
+      )
+      .min(1, 'Envía al menos una columna.')
+      .max(50, 'Demasiadas columnas.')
+      .refine((cols) => new Set(cols.map((c) => c.id)).size === cols.length, {
+        message: 'Los ids de las columnas no pueden repetirse.',
+      })
+      .optional(),
   }),
 });
 

@@ -58,14 +58,60 @@ export interface SyncTaskDto {
   deletedAt: string | null;
 }
 
+export interface SyncWorkspaceDto {
+  id: string;
+  name: string;
+  isPersonal: boolean;
+  /** Rol del usuario en ese workspace (en el personal siempre OWNER). */
+  myRole: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface SyncBoardDto {
+  id: string;
+  workspaceId: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+  /** Solo en el `record` de un alta de tablero: las columnas que quedaron creadas. */
+  columns?: SyncColumnDto[];
+}
+
+export interface SyncColumnDto {
+  id: string;
+  boardId: string;
+  name: string;
+  position: number;
+  wipLimit: number | null;
+  isDoneColumn: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface SyncSubtaskDto {
+  id: string;
+  taskId: string;
+  title: string;
+  completed: boolean;
+  position: number;
+  assigneeId: string | null;
+  dueAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
 export interface SyncChanges {
-  workspaces: unknown[];
+  workspaces: SyncWorkspaceDto[];
   boardAccess: unknown[];
-  boards: unknown[];
+  boards: SyncBoardDto[];
   lists: SyncListDto[];
-  columns: unknown[];
+  columns: SyncColumnDto[];
   tasks: SyncTaskDto[];
-  subtasks: unknown[];
+  subtasks: SyncSubtaskDto[];
   myDay: unknown[];
   reminders: unknown[];
 }

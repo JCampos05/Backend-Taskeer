@@ -1,0 +1,83 @@
+import { AppError } from '../../errors/AppError';
+import type { SyncMutationInput } from './sync.schema';
+import type { SyncPushStatus } from './sync.types';
+
+// Piezas comunes de las mutaciones de `push` (contrato v1.0 §4 y §5.7).
+
+// Tope de adelanto del reloj del cliente (§4.3.3): un dispositivo con la hora
+// muy adelantada no puede "ganar" siempre.
+const CLOCK_SKEW_MS = 5 * 60 * 1000;
+export interface Outcome {
+  status: SyncPushStatus;
+  record: unknown;
+  error?: { code: string; message: string };
+  /** false = no se guarda en SyncMutation (la mutación aún no es procesable en
+   * este despliegue; reenviarla más adelante debe poder funcionar). */
+  persist?: boolean;
+}
+
+export const applied = (record: unknown): Outcome => ({ status: 'applied', record });
+export const conflict = (record: unknown): Outcome => ({ status: 'conflict', record });
+export const rejected = (code: string, message: string, record: unknown = null, persist = true): Outcome => ({
+  status: 'rejected',
+  record,
+  error: { code, message },
+  persist,
+});
+
+// ---------------------------------------------------------------------------
+// Veredicto de conflictos (§4.3)
+// ---------------------------------------------------------------------------
+
+/** Decide si una mutación sobre un registro VIVO `S` que SÍ cambia algo se
+ * aplica o pierde. (El no-op y el tombstone se resuelven antes.) */
+export function decide(current: { updatedAt: Date }, m: SyncMutationInput, now: number): 'apply' | 'conflict' {
+  const base = m.baseUpdatedAt ? new Date(m.baseUpdatedAt).getTime() : null;
+  // El cliente conocía la versión vigente del servidor: se aplica sin comparar relojes.
+  if (base !== null && current.updatedAt.getTime() <= base) return 'apply';
+  // El servidor cambió después: gana el más reciente (reloj del cliente acotado).
+  const clientClock = Math.min(new Date(m.clientUpdatedAt).getTime(), now + CLOCK_SKEW_MS);
+  return clientClock > current.updatedAt.getTime() ? 'apply' : 'conflict';
+}
+
+/** Traduce un error de un service (AppError) al código del contrato. */
+export function toRejected(err: AppError): Outcome {
+  let code = err.code;
+  if (PASSTHROUGH_CODES.has(code)) return rejected(code, err.message);
+  if (err.statusCode === 403) code = 'FORBIDDEN';
+  else if (err.statusCode === 404) code = 'DEPENDENCY_NOT_FOUND';
+  else if ((err.statusCode === 400 || err.statusCode === 422) && !PASSTHROUGH_CODES.has(code)) {
+    code = 'INVALID_MUTATION';
+  }
+  return rejected(code, err.message);
+}
+
+// Códigos que el contrato define tal cual (§5.7) y deben llegar sin traducir.
+const PASSTHROUGH_CODES = new Set([
+  'COLUMN_WIP_LIMIT_REACHED',
+  'CROSS_WORKSPACE_MOVE',
+  'LIST_NAME_TAKEN',
+  'LAST_LIST',
+  'COLUMN_NOT_EMPTY',
+  'ID_ALREADY_IN_USE',
+  'WORKSPACE_LIMIT_REACHED',
+]);
+
+export const invalid = (message: string): Outcome => rejected('INVALID_MUTATION', message);
+
+
+export const sameDate = (a: Date | null, b: string | null): boolean =>
+  (a?.getTime() ?? null) === (b === null ? null : new Date(b).getTime());
+
+/** Segundo paso de una mutación (reordenar/mover dentro del mismo contenedor).
+ * El primer paso ya se confirmó en su propia transacción, así que si este falla
+ * con un 4xx NO se puede devolver `rejected` (el cliente revertiría algo que el
+ * servidor sí guardó): se ignora y el `record` devuelto trae la posición real.
+ * Los 5xx sí se relanzan. */
+export async function bestEffort(step: () => Promise<unknown>): Promise<void> {
+  try {
+    await step();
+  } catch (err) {
+    if (!(err instanceof AppError) || err.statusCode >= 500) throw err;
+  }
+}

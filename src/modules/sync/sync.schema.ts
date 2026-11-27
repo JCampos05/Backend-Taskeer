@@ -103,3 +103,47 @@ export const taskDataSchema = z
 
 export type ListData = z.infer<typeof listDataSchema>;
 export type TaskData = z.infer<typeof taskDataSchema>;
+
+export const boardDataSchema = z.object({
+  workspaceId: uuid,
+  name: z.string().trim().min(2).max(150),
+  // Solo en el alta: siembra ESTAS columnas (con sus ids) en vez de las tres por
+  // defecto. En una edición se ignora.
+  columns: z
+    .array(
+      z.object({
+        id: uuid,
+        name: z.string().trim().min(1).max(100),
+        position: z.number().int().min(0),
+        wipLimit: z.number().int().min(1).nullable().optional(),
+        isDoneColumn: z.boolean(),
+      }),
+    )
+    .min(1)
+    .max(50)
+    .refine((cols) => new Set(cols.map((c) => c.id)).size === cols.length, {
+      message: 'Los ids de las columnas no pueden repetirse.',
+    })
+    .optional(),
+});
+
+export const columnDataSchema = z.object({
+  boardId: uuid,
+  name: z.string().trim().min(1).max(100),
+  position: z.number().int().min(0),
+  wipLimit: z.number().int().min(1).nullable(),
+  isDoneColumn: z.boolean(),
+});
+
+export const subtaskDataSchema = z.object({
+  taskId: uuid,
+  title: z.string().trim().min(1).max(200),
+  completed: z.boolean(),
+  position: z.number().int().min(0),
+  assigneeId: uuid.nullable(),
+  dueAt: isoDate.nullable(),
+});
+
+export type BoardData = z.infer<typeof boardDataSchema>;
+export type ColumnData = z.infer<typeof columnDataSchema>;
+export type SubtaskData = z.infer<typeof subtaskDataSchema>;

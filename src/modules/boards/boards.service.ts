@@ -243,6 +243,22 @@ async function createBoard(
     if (existing) return resolveExistingBoard(existing, workspaceId);
   }
 
+  // Ids de columna del cliente que ya existan (en cualquier tablero): 409
+  // genérico, sin revelar de quién son. Sin esta comprobación el P2002 de la
+  // inserción saldría como un 500.
+  if (input.columns) {
+    // Repetidos DENTRO del propio envío (la ruta REST ya lo valida con Zod; el
+    // sync y cualquier otro llamador pasan directo al service).
+    if (new Set(input.columns.map((c) => c.id)).size !== input.columns.length) {
+      throw idAlreadyInUseError();
+    }
+    const taken = await prisma.column.findFirst({
+      where: { id: { in: input.columns.map((c) => c.id) } },
+      select: { id: true },
+    });
+    if (taken) throw idAlreadyInUseError();
+  }
+
   const slug = await generateUniqueSlug(workspaceId, input.name);
 
   let board;
@@ -256,6 +272,8 @@ async function createBoard(
       const existing = await prisma.board.findUnique({ where: { id: input.id } });
       if (existing) return resolveExistingBoard(existing, workspaceId);
     }
+    // Carrera por un id de columna del cliente: 409 genérico y no un 500.
+    if (input.columns && isUniqueConstraintError(err)) throw idAlreadyInUseError();
     throw err;
   }
 
@@ -273,12 +291,23 @@ async function createBoardWithColumns(workspaceId: string, input: CreateBoardInp
     // marcada como columna de completadas (ver Column.isDoneColumn en
     // schema.prisma) — el usuario puede desmarcarla o marcar otras después.
     await tx.column.createMany({
-      data: DEFAULT_COLUMN_NAMES.map((name, position) => ({
-        boardId: createdBoard.id,
-        name,
-        position,
-        isDoneColumn: name === 'Hecho',
-      })),
+      data: input.columns
+        ? [...input.columns]
+            .sort((a, b) => a.position - b.position)
+            .map((column, position) => ({
+              id: column.id,
+              boardId: createdBoard.id,
+              name: column.name,
+              position,
+              wipLimit: column.wipLimit ?? null,
+              isDoneColumn: column.isDoneColumn ?? false,
+            }))
+        : DEFAULT_COLUMN_NAMES.map((name, position) => ({
+            boardId: createdBoard.id,
+            name,
+            position,
+            isDoneColumn: name === 'Hecho',
+          })),
     });
 
     return createdBoard;

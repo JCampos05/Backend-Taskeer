@@ -1,4 +1,11 @@
-import type { SyncListDto, SyncTaskDto } from './sync.types';
+import type {
+  SyncBoardDto,
+  SyncColumnDto,
+  SyncListDto,
+  SyncSubtaskDto,
+  SyncTaskDto,
+  SyncWorkspaceDto,
+} from './sync.types';
 
 // Mapeo fila → DTO del contrato de sync. Lo comparten `changes` y `push` para
 // que el `record` de una mutación tenga EXACTAMENTE la misma forma que el de
@@ -25,34 +32,38 @@ export function toSyncListDto(board: {
   };
 }
 
-/** Tarea de LISTA plana: `listId` = id del tablero-lista; la columna interna no
- * se expone (`columnId` y `boardId` van nulos). */
-export function toSyncListTaskDto(
-  task: {
-    id: string;
-    title: string;
-    description: string | null;
-    priority: SyncTaskDto['priority'];
-    dueAt: Date | null;
-    assigneeId: string | null;
-    position: number;
-    completedAt: Date | null;
-    repeatUnit: string | null;
-    repeatInterval: number | null;
-    repeatWeekdays: number | null;
-    repeatAnchorDay: number | null;
-    repeatSuccessorId: string | null;
-    createdAt: Date;
-    updatedAt: Date;
-    deletedAt: Date | null;
-  },
-  listId: string,
+type TaskRow = {
+  id: string;
+  columnId: string;
+  title: string;
+  description: string | null;
+  priority: SyncTaskDto['priority'];
+  dueAt: Date | null;
+  assigneeId: string | null;
+  position: number;
+  completedAt: Date | null;
+  repeatUnit: string | null;
+  repeatInterval: number | null;
+  repeatWeekdays: number | null;
+  repeatAnchorDay: number | null;
+  repeatSuccessorId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+};
+
+/** Una tarea de LISTA plana viaja con `listId` (id del tablero-lista) y sin
+ * `columnId`/`boardId`: la columna interna de la lista nunca se expone. Una de
+ * tablero viaja con `columnId` y `boardId` y `listId` nulo. */
+export function toSyncTaskDto(
+  task: TaskRow,
+  container: { id: string; isList: boolean },
 ): SyncTaskDto {
   return {
     id: task.id,
-    boardId: null,
-    columnId: null,
-    listId,
+    boardId: container.isList ? null : container.id,
+    columnId: container.isList ? null : task.columnId,
+    listId: container.isList ? container.id : null,
     title: task.title,
     description: task.description,
     priority: task.priority,
@@ -68,5 +79,87 @@ export function toSyncListTaskDto(
     createdAt: iso(task.createdAt),
     updatedAt: iso(task.updatedAt),
     deletedAt: isoOrNull(task.deletedAt),
+  };
+}
+
+export function toSyncWorkspaceDto(
+  workspace: { id: string; name: string; isPersonal: boolean; updatedAt: Date; deletedAt: Date | null },
+  myRole: string,
+): SyncWorkspaceDto {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    isPersonal: workspace.isPersonal,
+    myRole,
+    updatedAt: iso(workspace.updatedAt),
+    deletedAt: isoOrNull(workspace.deletedAt),
+  };
+}
+
+export function toSyncBoardDto(board: {
+  id: string;
+  workspaceId: string;
+  name: string;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncBoardDto {
+  return {
+    id: board.id,
+    workspaceId: board.workspaceId,
+    name: board.name,
+    createdAt: iso(board.createdAt),
+    updatedAt: iso(board.updatedAt),
+    deletedAt: isoOrNull(board.deletedAt),
+  };
+}
+
+export function toSyncColumnDto(column: {
+  id: string;
+  boardId: string;
+  name: string;
+  position: number;
+  wipLimit: number | null;
+  isDoneColumn: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncColumnDto {
+  return {
+    id: column.id,
+    boardId: column.boardId,
+    name: column.name,
+    position: column.position,
+    wipLimit: column.wipLimit,
+    isDoneColumn: column.isDoneColumn,
+    createdAt: iso(column.createdAt),
+    updatedAt: iso(column.updatedAt),
+    deletedAt: isoOrNull(column.deletedAt),
+  };
+}
+
+export function toSyncSubtaskDto(subtask: {
+  id: string;
+  taskId: string;
+  title: string;
+  completed: boolean;
+  position: number;
+  assigneeId: string | null;
+  dueAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncSubtaskDto {
+  return {
+    id: subtask.id,
+    taskId: subtask.taskId,
+    title: subtask.title,
+    completed: subtask.completed,
+    position: subtask.position,
+    assigneeId: subtask.assigneeId,
+    dueAt: isoOrNull(subtask.dueAt),
+    createdAt: iso(subtask.createdAt),
+    updatedAt: iso(subtask.updatedAt),
+    deletedAt: isoOrNull(subtask.deletedAt),
   };
 }

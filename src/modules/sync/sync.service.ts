@@ -1,7 +1,14 @@
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { ensurePersonalWorkspace } from '../workspaces/personal-workspace';
-import { toSyncListDto, toSyncListTaskDto } from './sync.mappers';
+import {
+  toSyncBoardDto,
+  toSyncColumnDto,
+  toSyncListDto,
+  toSyncSubtaskDto,
+  toSyncTaskDto,
+  toSyncWorkspaceDto,
+} from './sync.mappers';
 import {
   SYNC_CONTRACT_VERSION,
   type SyncChangeKey,
@@ -22,8 +29,9 @@ import {
 // Una entidad no implementada no devuelve datos parciales: sale vacía y no se
 // anuncia en `supportedEntities`.
 
-/** Entidades que este servidor implementa COMPLETAS. H1: listas y sus tareas. */
-export const SUPPORTED_ENTITIES: SyncEntityName[] = ['list', 'task'];
+/** Entidades que este servidor implementa COMPLETAS. H2: listas, tableros,
+ * columnas, tareas y subtareas del workspace Personal. */
+export const SUPPORTED_ENTITIES: SyncEntityName[] = ['list', 'board', 'column', 'task', 'subtask'];
 
 // Horizonte de estabilidad. Solo se sirven filas con updatedAt <= ahora - margen.
 // `updatedAt` lo fija la escritura pero la fila solo es visible al COMMIT: una
@@ -154,11 +162,32 @@ async function getChanges(
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
   if (!user) throw new AppError(401, 'UNAUTHENTICATED', 'La sesión no es válida.');
 
-  // Las listas y sus tareas viven SIEMPRE en el workspace Personal del propio
-  // usuario: ese es todo el alcance de H1.
+  // H2: todo el alcance es el workspace Personal del propio usuario (listas,
+  // tableros, columnas, tareas y subtareas). Los workspaces compartidos llegan
+  // con H5.
   const personal = await ensurePersonalWorkspace(prisma, userId);
+  // Tableros/listas vivos del Personal: bajo un tablero borrado, su tombstone
+  // basta para que el cliente retire columnas y tareas (§4.8).
+  const liveBoard = { workspaceId: personal.id, deletedAt: null };
+  const taskScope = { column: { board: liveBoard } };
 
-  const [lists, tasks] = await Promise.all([
+  const [workspaces, boards, lists, columns, tasks, subtasks] = await Promise.all([
+    prisma.workspace.findMany({
+      where: { AND: [seekFor(cursor, RANK.workspaces, horizon), { id: personal.id }] },
+      orderBy: ORDER,
+      take,
+    }),
+    // Tableros normales del usuario, borrados incluidos (tombstone).
+    prisma.board.findMany({
+      where: {
+        AND: [
+          seekFor(cursor, RANK.boards, horizon),
+          { workspaceId: personal.id, isList: false },
+        ],
+      },
+      orderBy: ORDER,
+      take,
+    }),
     // Listas del usuario, borradas incluidas (tombstone).
     prisma.board.findMany({
       where: {
@@ -167,33 +196,49 @@ async function getChanges(
       orderBy: ORDER,
       take,
     }),
-    // Tareas de listas VIVAS, borradas incluidas (tombstone). Si la lista se
-    // borra, su tombstone basta para que el cliente retire sus tareas (§4.8).
-    prisma.task.findMany({
+    // Columnas de tableros normales vivos (la columna interna de una lista
+    // NUNCA se expone). Las borradas llegan como tombstone.
+    prisma.column.findMany({
       where: {
-        AND: [
-          seekFor(cursor, RANK.tasks, horizon),
-          { column: { board: { workspaceId: personal.id, isList: true, deletedAt: null } } },
-        ],
+        AND: [seekFor(cursor, RANK.columns, horizon), { board: { ...liveBoard, isList: false } }],
       },
-      include: { column: { select: { boardId: true } } },
+      orderBy: ORDER,
+      take,
+    }),
+    // Tareas de tableros y de listas vivos, borradas incluidas (tombstone).
+    prisma.task.findMany({
+      where: { AND: [seekFor(cursor, RANK.tasks, horizon), taskScope] },
+      include: { column: { select: { boardId: true, board: { select: { isList: true } } } } },
+      orderBy: ORDER,
+      take,
+    }),
+    // Subtareas de tareas VIVAS (si la tarea se borra, su tombstone basta).
+    prisma.subtask.findMany({
+      where: {
+        AND: [seekFor(cursor, RANK.subtasks, horizon), { task: { ...taskScope, deletedAt: null } }],
+      },
       orderBy: ORDER,
       take,
     }),
   ]);
 
+  const tag = (key: SyncChangeKey, r: { id: string; updatedAt: Date }, dto: unknown): Tagged => ({
+    key,
+    updatedAt: r.updatedAt,
+    id: r.id,
+    dto,
+  });
+
   const merged: Tagged[] = [
-    ...lists.map(
-      (r): Tagged => ({ key: 'lists', updatedAt: r.updatedAt, id: r.id, dto: toSyncListDto(r) }),
+    // El personal siempre es del propio usuario, con rol OWNER.
+    ...workspaces.map((r) => tag('workspaces', r, toSyncWorkspaceDto(r, 'OWNER'))),
+    ...boards.map((r) => tag('boards', r, toSyncBoardDto(r))),
+    ...lists.map((r) => tag('lists', r, toSyncListDto(r))),
+    ...columns.map((r) => tag('columns', r, toSyncColumnDto(r))),
+    ...tasks.map((r) =>
+      tag('tasks', r, toSyncTaskDto(r, { id: r.column.boardId, isList: r.column.board.isList })),
     ),
-    ...tasks.map(
-      (r): Tagged => ({
-        key: 'tasks',
-        updatedAt: r.updatedAt,
-        id: r.id,
-        dto: toSyncListTaskDto(r, r.column.boardId),
-      }),
-    ),
+    ...subtasks.map((r) => tag('subtasks', r, toSyncSubtaskDto(r))),
   ];
 
   merged.sort(compareTagged);
@@ -201,7 +246,7 @@ async function getChanges(
 
   // Hay más si la mezcla excedió el límite, o si alguna entidad llenó su
   // ventana de limit + 1 (pudo quedarse con filas fuera de la consulta).
-  const hasMore = merged.length > limit || [lists, tasks].some((rows) => rows.length > limit);
+  const hasMore = merged.length > limit || [workspaces, boards, lists, columns, tasks, subtasks].some((rows) => rows.length > limit);
 
   // Con hasMore el cursor avanza hasta la última fila SERVIDA. Sin hasMore todo
   // lo anterior al horizonte ya se sirvió, así que el cursor salta al horizonte
