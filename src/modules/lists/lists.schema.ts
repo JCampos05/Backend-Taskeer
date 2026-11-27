@@ -5,6 +5,15 @@ import { z } from 'zod';
 
 const uuidParam = z.string().uuid('El identificador no es válido.');
 
+// `id` generado por el CLIENTE al crear (apps offline-first): se normaliza a
+// minúsculas. Un cliente nativo puede mandar UUID en mayúsculas (p. ej.
+// UUID().uuidString de Swift); guardarlos tal cual haría que el orden por id de
+// la sincronización dependiera del collation de MySQL en vez de ser ordinal.
+const clientId = z
+  .string()
+  .uuid('El identificador no es válido.')
+  .transform((value) => value.toLowerCase());
+
 const nameField = z
   .string()
   .trim()
@@ -19,7 +28,7 @@ const positionField = z
 export const createListSchema = z.object({
   body: z.object({
     // UUID generado por el cliente; creación idempotente (ver lists.service.ts).
-    id: uuidParam.optional(),
+    id: clientId.optional(),
     name: nameField,
     position: positionField.optional(),
   }),

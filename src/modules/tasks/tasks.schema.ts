@@ -5,6 +5,15 @@ import { z } from 'zod';
 
 const uuidParam = z.string().uuid('El identificador no es válido.');
 
+// `id` generado por el CLIENTE al crear (apps offline-first): se normaliza a
+// minúsculas. Un cliente nativo puede mandar UUID en mayúsculas (p. ej.
+// UUID().uuidString de Swift); guardarlos tal cual haría que el orden por id de
+// la sincronización dependiera del collation de MySQL en vez de ser ordinal.
+const clientId = z
+  .string()
+  .uuid('El identificador no es válido.')
+  .transform((value) => value.toLowerCase());
+
 // ISO 8601 tal cual — se guarda en UTC sin convertir zona horaria en el
 // backend (ver CLAUDE.md, reglas no negociables).
 const isoDateString = z.string().datetime({ message: 'La fecha debe ser un ISO 8601 válido.' });
@@ -50,7 +59,7 @@ export const createTaskSchema = z.object({
     // UUID generado por el cliente (apps offline-first). Si se omite, lo
     // genera el servidor; si ya existe en el mismo contexto, la creación es
     // idempotente (devuelve la existente). Ver tasks.service.ts.
-    id: uuidParam.optional(),
+    id: clientId.optional(),
     columnId: uuidParam,
     title: z
       .string()
@@ -134,7 +143,7 @@ export const moveTaskSchema = z.object({
 export const createSubtaskSchema = z.object({
   params: z.object({ taskId: uuidParam }),
   body: z.object({
-    id: uuidParam.optional(),
+    id: clientId.optional(),
     title: z
       .string()
       .trim()

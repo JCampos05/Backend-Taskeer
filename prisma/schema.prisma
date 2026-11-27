@@ -37,6 +37,12 @@ enum ReminderStatus {
   DISMISSED
 }
 
+enum SyncMutationStatus {
+  APPLIED
+  CONFLICT
+  REJECTED
+}
+
 enum AuthTokenType {
   EMAIL_VERIFICATION
   PASSWORD_RESET
@@ -149,6 +155,7 @@ model User {
   oauthIdentities    OAuthIdentity[]
   attachments        Attachment[]
   myDayTasks         MyDayTask[]
+  syncMutations      SyncMutation[]
 
   @@map("users")
 }
@@ -358,6 +365,9 @@ model Invitation {
   status      InvitationStatus @default(PENDING)
   expiresAt   DateTime
   createdAt   DateTime         @default(now())
+  // Para la sincronización: el estado cambia (aprobada, revocada...) sin
+  // borrar la fila, así que `updatedAt` es lo que permite pedir "qué cambió".
+  updatedAt   DateTime         @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   invitedBy User      @relation("InvitationsSent", fields: [invitedById], references: [id], onDelete: Cascade)
@@ -366,6 +376,7 @@ model Invitation {
   // al momento en que alguien se registra con un correo que tiene invitaciones esperando.
   @@index([workspaceId, status])
   @@index([email])
+  @@index([updatedAt])
   @@map("invitations")
 }
 
@@ -375,6 +386,8 @@ model WorkspaceMember {
   userId      String        @db.Char(36)
   role        WorkspaceRole @default(EDITOR)
   createdAt   DateTime      @default(now())
+  // Para la sincronización: un cambio de rol modifica la fila sin crear otra.
+  updatedAt   DateTime      @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -383,6 +396,7 @@ model WorkspaceMember {
   // workspace?" en un solo lookup indexado — se consulta en cada request autenticado.
   @@unique([workspaceId, userId])
   @@index([userId])
+  @@index([updatedAt])
   @@map("workspace_members")
 }
 
@@ -412,6 +426,7 @@ model Board {
   // Listado y orden de listas planas (y, con isList = false, de tableros
   // normales) de un workspace.
   @@index([workspaceId, isList, listPosition])
+  @@index([updatedAt])
   @@map("boards")
 }
 
@@ -476,6 +491,7 @@ model Column {
   tasks Task[]
 
   @@index([boardId, position])
+  @@index([updatedAt])
   @@map("columns")
 }
 
@@ -539,6 +555,7 @@ model Task {
   @@index([columnId, position])
   @@index([assigneeId])
   @@index([dueAt])
+  @@index([updatedAt])
   @@map("tasks")
 }
 
@@ -572,6 +589,7 @@ model MyDayTask {
   // esta combinación. Este unique ya cubre "todas las MyDayTask de este
   // usuario" como prefijo izquierdo, sin falta de un índice aparte por userId.
   @@unique([userId, taskId])
+  @@index([userId, updatedAt])
   @@map("my_day_tasks")
 }
 
@@ -599,6 +617,7 @@ model Subtask {
 
   @@index([taskId, position])
   @@index([assigneeId])
+  @@index([updatedAt])
   @@map("subtasks")
 }
 
@@ -609,12 +628,17 @@ model Reminder {
   status    ReminderStatus @default(PENDING)
   sentAt    DateTime?
   createdAt DateTime       @default(now())
+  // Para la sincronización. Cancelar un recordatorio no borra la fila (pasa a
+  // DISMISSED), así que ese estado ya hace de "borrado lógico" y `updatedAt`
+  // basta para comunicarlo; no hace falta `deletedAt`.
+  updatedAt DateTime       @updatedAt
 
   task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
   // Índice pensado exactamente para la query del worker:
   // WHERE status = 'PENDING' AND remindAt <= NOW()
   @@index([status, remindAt])
+  @@index([updatedAt])
   @@map("reminders")
 }
 
@@ -765,4 +789,23 @@ model SubscriptionEntitlementOverride {
 
   @@unique([subscriptionId, key])
   @@map("subscription_entitlement_overrides")
+}
+
+// Mutaciones de POST /sync/push ya procesadas. Es lo que hace idempotente el
+// reenvío: el mismo (userId, clientMutationId) devuelve el resultado guardado
+// sin ejecutar nada. Se conserva ≥ 30 días y se purga de forma perezosa desde
+// el propio push. Nunca guarda el cuerpo de la mutación, solo el veredicto.
+model SyncMutation {
+  id               String             @id @default(uuid()) @db.Char(36)
+  userId           String             @db.Char(36)
+  clientMutationId String             @db.Char(36)
+  status           SyncMutationStatus
+  resultJson       Json
+  createdAt        DateTime           @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientMutationId])
+  @@index([createdAt])
+  @@map("sync_mutations")
 }

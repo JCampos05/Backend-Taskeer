@@ -458,6 +458,18 @@ async function updateTask(taskId: string, userId: string, input: UpdateTaskInput
     },
   });
 
+  // Sincronización: los recordatorios de una tarea solo viajan a quien la tiene
+  // asignada (o a su dueño en el workspace Personal). Al cambiar la persona
+  // asignada hay que re-emitir los recordatorios de la tarea (subirles el
+  // updatedAt), o el nuevo responsable no los recibiría nunca: el cursor ya los
+  // dejó atrás.
+  if (input.assigneeId !== undefined && input.assigneeId !== task.assigneeId) {
+    await prisma.reminder.updateMany({
+      where: { taskId: updated.id },
+      data: { updatedAt: new Date() },
+    });
+  }
+
   // Solo notifica si el assigneeId cambió a alguien nuevo y específico —
   // no en un unassign (input.assigneeId === null) ni si quedó igual.
   if (

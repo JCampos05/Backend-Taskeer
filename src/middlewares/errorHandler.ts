@@ -18,7 +18,41 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     });
   }
 
-  console.error(err);
+  // Errores del body parser (express.json): cuerpo demasiado grande o JSON roto.
+  // Sin esto salían como 500. En /sync el tamaño tiene su código propio.
+  const parserError = err as { type?: string } | null;
+  if (parserError?.type === 'entity.too.large') {
+    const isSync = req.originalUrl.startsWith('/api/v1/sync/');
+    return res.status(413).json({
+      error: {
+        code: isSync ? 'BATCH_TOO_LARGE' : 'PAYLOAD_TOO_LARGE',
+        message: 'El cuerpo de la petición es demasiado grande.',
+      },
+    });
+  }
+  if (parserError?.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', message: 'El cuerpo de la petición no es un JSON válido.' },
+    });
+  }
+
+  // Otros errores del parser con status 4xx (codificación, abortada...) son
+  // defecto de la petición, no un fallo del servidor.
+  const status = (err as { status?: unknown } | null)?.status;
+  if (typeof status === 'number' && status >= 400 && status < 500 && parserError?.type) {
+    return res.status(status).json({
+      error: { code: 'VALIDATION_ERROR', message: 'La petición no es válida.' },
+    });
+  }
+
+  // En /sync un error de Prisma puede traer en su mensaje los argumentos de la
+  // consulta (título/descripción del usuario): ahí solo se registra qué falló.
+  if (req.originalUrl.startsWith('/api/v1/sync/')) {
+    const e = err as { name?: string; code?: string; stack?: string };
+    console.error('[sync]', e?.name, e?.code, e?.stack?.split('\n')[1]?.trim());
+  } else {
+    console.error(err);
+  }
   return res.status(500).json({
     error: { code: 'INTERNAL_SERVER_ERROR', message: 'Ocurrió un error inesperado.' },
   });

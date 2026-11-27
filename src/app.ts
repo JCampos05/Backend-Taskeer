@@ -13,6 +13,7 @@ import { myDayRouter } from './modules/my-day/my-day.routes';
 import { notificationsRouter } from './modules/notifications/notifications.routes';
 import { preferencesRouter } from './modules/preferences/preferences.routes';
 import { remindersRouter } from './modules/reminders/reminders.routes';
+import { syncRouter } from './modules/sync/sync.routes';
 import { tasksRouter } from './modules/tasks/tasks.routes';
 import { workspacesRouter } from './modules/workspaces/workspaces.routes';
 import { catalogsRouter } from './routes/catalogs.routes';
@@ -44,6 +45,13 @@ app.use(
     limit: 300,
     standardHeaders: true,
     legacyHeaders: false,
+    // /sync/* tiene su PROPIO limitador por usuario (más holgado): una carga
+    // inicial paginada o la sincronización frecuente agotaría el contador por IP
+    // (compartido, p. ej., por muchos móviles tras la misma red) y lo gastaría
+    // para el resto de la API.
+    // Solo con credenciales: sin `Authorization` la petición sigue contando
+    // contra el límite por IP (no hay usuario al que atribuirla).
+    skip: (req) => req.path.startsWith('/api/v1/sync/') && Boolean(req.headers.authorization),
   }),
 );
 
@@ -67,6 +75,7 @@ apiRouter.use(notificationsRouter);
 apiRouter.use(preferencesRouter);
 apiRouter.use(myDayRouter);
 apiRouter.use(billingRouter);
+apiRouter.use(syncRouter);
 // Un módulo nuevo de dominio nunca debe quedar huérfano sin montar aquí.
 
 app.use('/api/v1', apiRouter);

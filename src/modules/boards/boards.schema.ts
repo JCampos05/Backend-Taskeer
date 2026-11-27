@@ -5,6 +5,15 @@ import { z } from 'zod';
 
 const uuidParam = z.string().uuid('El identificador no es válido.');
 
+// `id` generado por el CLIENTE al crear (apps offline-first): se normaliza a
+// minúsculas. Un cliente nativo puede mandar UUID en mayúsculas (p. ej.
+// UUID().uuidString de Swift); guardarlos tal cual haría que el orden por id de
+// la sincronización dependiera del collation de MySQL en vez de ser ordinal.
+const clientId = z
+  .string()
+  .uuid('El identificador no es válido.')
+  .transform((value) => value.toLowerCase());
+
 // Mismo alfabeto que produce el slugify de boards.service.ts — evita que
 // alguien fuerce un slug con mayúsculas o caracteres raros directo por API.
 const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -17,7 +26,7 @@ export const createBoardSchema = z.object({
   params: z.object({ workspaceId: uuidParam }),
   body: z.object({
     // UUID generado por el cliente; creación idempotente (ver boards.service.ts).
-    id: uuidParam.optional(),
+    id: clientId.optional(),
     name: z
       .string()
       .trim()
@@ -67,7 +76,7 @@ const wipLimitField = z
 export const createColumnSchema = z.object({
   params: z.object({ workspaceId: uuidParam, boardId: uuidParam }),
   body: z.object({
-    id: uuidParam.optional(),
+    id: clientId.optional(),
     name: z
       .string()
       .trim()
