@@ -11,6 +11,40 @@ const isoDateString = z.string().datetime({ message: 'La fecha debe ser un ISO 8
 
 const taskPriority = z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']);
 
+// --- Repetición de tareas (solo se guarda; el backend no calcula nada) ---
+// La app calcula la sucesora al completar; aquí solo se validan rangos. La
+// coherencia entre campos (sin repeatUnit el resto debe ser nulo, etc.) se
+// comprueba en el service, porque en un PATCH hay que cruzarla con lo ya
+// guardado.
+export const REPEAT_UNITS = ['DAY', 'WEEK', 'MONTH', 'YEAR'] as const;
+
+const repeatFields = {
+  repeatUnit: z.enum(REPEAT_UNITS).nullable().optional(),
+  repeatInterval: z
+    .number()
+    .int('El intervalo debe ser un entero.')
+    .min(1, 'El intervalo debe ser al menos 1.')
+    .max(1000, 'El intervalo es demasiado grande.')
+    .nullable()
+    .optional(),
+  // Máscara de 7 bits: lunes = bit 0 ... domingo = bit 6. 0 = sin días fijos.
+  repeatWeekdays: z
+    .number()
+    .int('Los días de la semana deben ser un entero.')
+    .min(0, 'Los días de la semana no son válidos.')
+    .max(127, 'Los días de la semana no son válidos.')
+    .nullable()
+    .optional(),
+  repeatAnchorDay: z
+    .number()
+    .int('El día ancla debe ser un entero.')
+    .min(1, 'El día ancla debe estar entre 1 y 31.')
+    .max(31, 'El día ancla debe estar entre 1 y 31.')
+    .nullable()
+    .optional(),
+  repeatSuccessorId: uuidParam.nullable().optional(),
+};
+
 export const createTaskSchema = z.object({
   body: z.object({
     // UUID generado por el cliente (apps offline-first). Si se omite, lo
@@ -28,6 +62,7 @@ export const createTaskSchema = z.object({
     assigneeId: uuidParam.optional(),
     priority: taskPriority.optional(),
     completedAt: isoDateString.optional(),
+    ...repeatFields,
   }),
 });
 
@@ -64,6 +99,7 @@ export const updateTaskSchema = z.object({
       // El cliente envía el instante en que completó la tarea (null = la
       // reabre). El servidor no mueve la tarea de columna por su cuenta.
       completedAt: isoDateString.nullable().optional(),
+      ...repeatFields,
     })
     .refine(
       (data) =>
@@ -72,7 +108,12 @@ export const updateTaskSchema = z.object({
         data.dueAt !== undefined ||
         data.assigneeId !== undefined ||
         data.priority !== undefined ||
-        data.completedAt !== undefined,
+        data.completedAt !== undefined ||
+        data.repeatUnit !== undefined ||
+        data.repeatInterval !== undefined ||
+        data.repeatWeekdays !== undefined ||
+        data.repeatAnchorDay !== undefined ||
+        data.repeatSuccessorId !== undefined,
       { message: 'Debes enviar al menos un campo para actualizar.' },
     ),
 });

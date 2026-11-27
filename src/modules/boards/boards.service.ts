@@ -337,7 +337,7 @@ async function getBoardById(
   const myDayTaskIds = new Set(
     (
       await prisma.myDayTask.findMany({
-        where: { userId, taskId: { in: taskIds } },
+        where: { userId, taskId: { in: taskIds }, deletedAt: null },
         select: { taskId: true },
       })
     ).map((entry) => entry.taskId),
@@ -841,8 +841,16 @@ async function moveBoards(
           const overrides = await tx.boardMemberOverride.deleteMany({
             where: { boardId: board.id },
           });
-          await tx.myDayTask.deleteMany({
-            where: { task: { column: { boardId: board.id } }, userId: { notIn: targetMemberIds } },
+          // Quien pierde acceso al tablero pierde también sus marcas de Mi día
+          // de él: soft delete (tombstone), no borrado físico, para que la
+          // sincronización pueda comunicarlo.
+          await tx.myDayTask.updateMany({
+            where: {
+              task: { column: { boardId: board.id } },
+              userId: { notIn: targetMemberIds },
+              deletedAt: null,
+            },
+            data: { deletedAt: new Date() },
           });
 
           tasksUnassigned += tasks.count;

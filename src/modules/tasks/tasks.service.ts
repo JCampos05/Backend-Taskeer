@@ -39,6 +39,11 @@ function toTaskDto(task: {
   priority: PrismaTaskPriority;
   position: number;
   completedAt: Date | null;
+  repeatUnit: string | null;
+  repeatInterval: number | null;
+  repeatWeekdays: number | null;
+  repeatAnchorDay: number | null;
+  repeatSuccessorId: string | null;
   createdAt: Date;
   updatedAt: Date;
 }): TaskDto {
@@ -52,6 +57,11 @@ function toTaskDto(task: {
     priority: task.priority,
     position: task.position,
     completedAt: task.completedAt ? task.completedAt.toISOString() : null,
+    repeatUnit: task.repeatUnit as TaskDto['repeatUnit'],
+    repeatInterval: task.repeatInterval,
+    repeatWeekdays: task.repeatWeekdays,
+    repeatAnchorDay: task.repeatAnchorDay,
+    repeatSuccessorId: task.repeatSuccessorId,
     createdAt: task.createdAt.toISOString(),
     updatedAt: task.updatedAt.toISOString(),
   };
@@ -204,6 +214,45 @@ async function notifyTaskAssigned(
   pushNotification(notification);
 }
 
+interface RepeatRule {
+  repeatUnit: string | null;
+  repeatInterval: number | null;
+  repeatWeekdays: number | null;
+  repeatAnchorDay: number | null;
+}
+
+/** Coherencia de la regla de repetición (los rangos ya los validó Zod):
+ * - sin repeatUnit, intervalo/días/día ancla deben ser nulos;
+ * - con repeatUnit, repeatInterval es obligatorio;
+ * - repeatWeekdays solo con WEEK; repeatAnchorDay solo con MONTH o YEAR.
+ * El backend no interpreta la regla: solo evita guardar combinaciones
+ * absurdas que otro dispositivo no sabría leer. */
+function assertRepeatRuleCoherent(rule: RepeatRule) {
+  const invalid = (message: string) =>
+    new AppError(400, 'INVALID_REPEAT_RULE', message);
+
+  if (rule.repeatUnit === null) {
+    if (
+      rule.repeatInterval !== null ||
+      rule.repeatWeekdays !== null ||
+      rule.repeatAnchorDay !== null
+    ) {
+      throw invalid('La repetición necesita una unidad (repeatUnit).');
+    }
+    return;
+  }
+
+  if (rule.repeatInterval === null) {
+    throw invalid('La repetición necesita un intervalo (repeatInterval).');
+  }
+  if (rule.repeatWeekdays !== null && rule.repeatUnit !== 'WEEK') {
+    throw invalid('Los días de la semana solo aplican a repeticiones semanales.');
+  }
+  if (rule.repeatAnchorDay !== null && rule.repeatUnit !== 'MONTH' && rule.repeatUnit !== 'YEAR') {
+    throw invalid('El día ancla solo aplica a repeticiones mensuales o anuales.');
+  }
+}
+
 /** Toma el bloqueo del workspace y vuelve a comprobar, ya dentro de él, que la
  * columna (y su tablero) siguen vivos. Se usa al crear o mover tareas hacia una
  * lista plana: serializa contra deleteList (módulo lists), que borra la lista y
@@ -253,6 +302,14 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<Creat
     if (existing) return resolveExistingTask(existing, column.id);
   }
 
+  const repeatRule: RepeatRule = {
+    repeatUnit: input.repeatUnit ?? null,
+    repeatInterval: input.repeatInterval ?? null,
+    repeatWeekdays: input.repeatWeekdays ?? null,
+    repeatAnchorDay: input.repeatAnchorDay ?? null,
+  };
+  assertRepeatRuleCoherent(repeatRule);
+
   await assertAssigneeIsMember(board.workspaceId, input.assigneeId);
   await assertWipLimitNotReached(column.id, column.wipLimit);
 
@@ -277,6 +334,8 @@ async function createTask(userId: string, input: CreateTaskInput): Promise<Creat
         priority: input.priority ?? 'MEDIUM',
         position: nextPosition,
         completedAt: input.completedAt ? new Date(input.completedAt) : null,
+        ...repeatRule,
+        repeatSuccessorId: input.repeatSuccessorId ?? null,
       },
     });
   };
@@ -357,9 +416,37 @@ async function updateTask(taskId: string, userId: string, input: UpdateTaskInput
     await assertAssigneeIsMember(workspaceId, input.assigneeId);
   }
 
+  // Repetición: se cruza lo enviado con lo ya guardado y se valida la regla
+  // resultante. Quitar la unidad (null) limpia por sí solo el resto de la
+  // regla, para que un cliente pueda "dejar de repetir" con un único campo;
+  // repeatSuccessorId es independiente y no se toca.
+  const repeatChanged =
+    input.repeatUnit !== undefined ||
+    input.repeatInterval !== undefined ||
+    input.repeatWeekdays !== undefined ||
+    input.repeatAnchorDay !== undefined;
+  let nextRepeat: RepeatRule | null = null;
+  if (repeatChanged) {
+    nextRepeat =
+      input.repeatUnit === null
+        ? { repeatUnit: null, repeatInterval: null, repeatWeekdays: null, repeatAnchorDay: null }
+        : {
+            repeatUnit: input.repeatUnit !== undefined ? input.repeatUnit : task.repeatUnit,
+            repeatInterval:
+              input.repeatInterval !== undefined ? input.repeatInterval : task.repeatInterval,
+            repeatWeekdays:
+              input.repeatWeekdays !== undefined ? input.repeatWeekdays : task.repeatWeekdays,
+            repeatAnchorDay:
+              input.repeatAnchorDay !== undefined ? input.repeatAnchorDay : task.repeatAnchorDay,
+          };
+    assertRepeatRuleCoherent(nextRepeat);
+  }
+
   const updated = await prisma.task.update({
     where: { id: task.id },
     data: {
+      ...(nextRepeat ?? {}),
+      ...(input.repeatSuccessorId !== undefined ? { repeatSuccessorId: input.repeatSuccessorId } : {}),
       ...(input.title !== undefined ? { title: input.title } : {}),
       ...(input.description !== undefined ? { description: input.description } : {}),
       ...(input.dueAt !== undefined ? { dueAt: input.dueAt ? new Date(input.dueAt) : null } : {}),
@@ -789,17 +876,38 @@ async function isTaskInMyDay(taskId: string, userId: string): Promise<boolean> {
   const entry = await prisma.myDayTask.findUnique({
     where: { userId_taskId: { userId, taskId } },
   });
-  return entry !== null;
+  return entry !== null && entry.deletedAt === null;
 }
 
 /** Idempotente: si ya estaba agregada, no hace nada (no es un error). */
 async function addTaskToMyDay(taskId: string, userId: string): Promise<void> {
   await requireTaskAccess(taskId, userId);
 
-  await prisma.myDayTask.upsert({
+  const existing = await prisma.myDayTask.findUnique({
     where: { userId_taskId: { userId, taskId } },
-    update: {},
-    create: { userId, taskId },
+  });
+
+  if (!existing) {
+    try {
+      await prisma.myDayTask.create({ data: { userId, taskId } });
+    } catch (err) {
+      // Dos altas simultáneas (doble clic, reintento offline): la segunda
+      // choca con el unique userId+taskId. La operación es idempotente, así
+      // que se resuelve como no-op en vez de un 500.
+      if (!isUniqueConstraintError(err)) throw err;
+    }
+    return;
+  }
+
+  // Ya estaba viva: no se toca (ni se sube updatedAt: sincronizar un no-op
+  // haría que los clientes la re-descarguen sin motivo).
+  if (existing.deletedAt === null) return;
+
+  // Estaba quitada (tombstone): se reactiva en la MISMA fila (unique
+  // userId+taskId) como una alta nueva.
+  await prisma.myDayTask.updateMany({
+    where: { id: existing.id, deletedAt: { not: null } },
+    data: { deletedAt: null, addedAt: new Date() },
   });
 }
 
@@ -810,7 +918,12 @@ async function addTaskToMyDay(taskId: string, userId: string): Promise<void> {
 async function removeTaskFromMyDay(taskId: string, userId: string): Promise<void> {
   await requireTaskAccess(taskId, userId);
 
-  await prisma.myDayTask.deleteMany({ where: { userId, taskId } });
+  // Soft delete (tombstone) en vez de borrar la fila: la sincronización
+  // necesita poder comunicar la baja a otros dispositivos.
+  await prisma.myDayTask.updateMany({
+    where: { userId, taskId, deletedAt: null },
+    data: { deletedAt: new Date() },
+  });
 }
 
 /** Tareas que el usuario agregó a su "Mi día", cruzando todos sus workspaces
@@ -821,6 +934,7 @@ async function listMyDayTasks(userId: string): Promise<MyDayTaskDto[]> {
   const entries = await prisma.myDayTask.findMany({
     where: {
       userId,
+      deletedAt: null,
       task: {
         deletedAt: null,
         completedAt: null,

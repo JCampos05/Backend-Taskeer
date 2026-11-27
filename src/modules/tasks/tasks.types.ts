@@ -19,6 +19,14 @@ export interface TaskDto {
   // Instante UTC en que el cliente marcó la tarea como completada; null = no
   // completada. Independiente de la columna en que esté la tarea.
   completedAt: string | null;
+  // Regla de repetición, guardada tal cual (el backend no calcula
+  // recurrencias; la app crea la sucesora al completar). Todo null = no se
+  // repite. repeatWeekdays: máscara de bits, lunes = bit 0 ... domingo = bit 6.
+  repeatUnit: 'DAY' | 'WEEK' | 'MONTH' | 'YEAR' | null;
+  repeatInterval: number | null;
+  repeatWeekdays: number | null;
+  repeatAnchorDay: number | null;
+  repeatSuccessorId: string | null;
   createdAt: string;
   updatedAt: string;
 }
