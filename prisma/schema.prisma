@@ -31,6 +31,13 @@ enum WorkspaceRole {
   VIEWER
 }
 
+// Quién dispara el aviso. SERVER: el worker del backend (web). MOBILE: lo creó la
+// app móvil por sync y ella misma lo avisa en local; el worker lo ignora.
+enum ReminderOrigin {
+  SERVER
+  MOBILE
+}
+
 enum ReminderStatus {
   PENDING
   SENT
@@ -156,6 +163,7 @@ model User {
   attachments        Attachment[]
   myDayTasks         MyDayTask[]
   syncMutations      SyncMutation[]
+  createdReminders   Reminder[]            @relation("ReminderCreator")
 
   @@map("users")
 }
@@ -330,19 +338,19 @@ model Attachment {
 }
 
 model Workspace {
-  id        String    @id @default(uuid()) @db.Char(36)
-  name      String    @db.VarChar(150)
-  slug      String    @unique @db.VarChar(160)
-  ownerId   String    @db.Char(36)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  deletedAt DateTime?
+  id         String    @id @default(uuid()) @db.Char(36)
+  name       String    @db.VarChar(150)
+  slug       String    @unique @db.VarChar(160)
+  ownerId    String    @db.Char(36)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
   // Workspace "Personal" que cada usuario recibe al registrarse (único por
   // usuario, solo él es miembro). Aloja sus tableros propios y las listas
   // planas / bandeja de la app móvil (Board.isList). No cuenta contra el
   // límite de workspaces del plan y no se puede borrar, transferir ni invitar
   // a otras personas.
-  isPersonal  Boolean   @default(false)
+  isPersonal Boolean   @default(false)
 
   members     WorkspaceMember[]
   boards      Board[]
@@ -401,19 +409,19 @@ model WorkspaceMember {
 }
 
 model Board {
-  id          String    @id @default(uuid()) @db.Char(36)
-  workspaceId String    @db.Char(36)
-  name        String    @db.VarChar(150)
-  slug        String    @db.VarChar(160)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  deletedAt   DateTime?
+  id           String    @id @default(uuid()) @db.Char(36)
+  workspaceId  String    @db.Char(36)
+  name         String    @db.VarChar(150)
+  slug         String    @db.VarChar(160)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
   // Lista plana de la app móvil (incluida la bandeja "Tareas"): un tablero
   // OCULTO de una sola columna dentro del workspace personal. No aparece en
   // los listados de tableros de la web y solo se gestiona por /lists, nunca
   // por los endpoints de tableros/columnas. `listPosition` ordena las listas.
-  isList       Boolean  @default(false)
-  listPosition Int      @default(0)
+  isList       Boolean   @default(false)
+  listPosition Int       @default(0)
 
   workspace       Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   columns         Column[]
@@ -460,9 +468,9 @@ model BoardMemberOverride {
 }
 
 model Column {
-  id           String   @id @default(uuid()) @db.Char(36)
-  boardId      String   @db.Char(36)
-  name         String   @db.VarChar(100)
+  id           String    @id @default(uuid()) @db.Char(36)
+  boardId      String    @db.Char(36)
+  name         String    @db.VarChar(100)
   position     Int
   // Límite de tareas simultáneas (no borradas) en esta columna — null =
   // ilimitado. Configurable por OWNER/ADMIN del workspace, igual que el
@@ -479,9 +487,9 @@ model Column {
   // igual que wipLimit. Nombre con prefijo is+Column (no solo "isDone") a
   // propósito: distingue "esta es la columna de terminadas" de un futuro
   // Task.isDone que signifique otra cosa ("esta tarea puntual ya se hizo").
-  isDoneColumn Boolean  @default(false)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  isDoneColumn Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
   // Soft delete (tombstone): un dispositivo que sincroniza tarde necesita saber
   // que la columna se borró; con borrado físico no queda rastro y el dato
   // "resucita" desde el otro dispositivo. Toda lectura filtra deletedAt: null.
@@ -503,21 +511,21 @@ enum TaskPriority {
 }
 
 model Task {
-  id          String       @id @default(uuid()) @db.Char(36)
-  columnId    String       @db.Char(36)
-  assigneeId  String?      @db.Char(36)
-  title       String       @db.VarChar(200)
-  description String?      @db.Text
-  dueAt       DateTime?
+  id                String       @id @default(uuid()) @db.Char(36)
+  columnId          String       @db.Char(36)
+  assigneeId        String?      @db.Char(36)
+  title             String       @db.VarChar(200)
+  description       String?      @db.Text
+  dueAt             DateTime?
   // Reintroducido de una versión alpha anterior de Taskeer — reemplaza la
   // idea de swimlanes que se había planteado (el usuario prefirió esto).
-  priority    TaskPriority @default(MEDIUM)
-  position    Int
+  priority          TaskPriority @default(MEDIUM)
+  position          Int
   // Instante (UTC) en que se completó la tarea, fijado por el CLIENTE (así
   // funciona sin conexión). Independiente de la columna: Column.isDoneColumn
   // sigue siendo un atajo de UI, pero completar y mover son operaciones
   // distintas. null = no completada.
-  completedAt DateTime?
+  completedAt       DateTime?
   // Regla de repetición, guardada TAL CUAL: el backend NO calcula recurrencias
   // ni crea la tarea siguiente — lo hace la app al completar (la sucesora llega
   // como una tarea normal con su propio id, idempotente por el `id` de
@@ -526,7 +534,7 @@ model Task {
   // enum a propósito: un enum de Prisma es un ENUM de MySQL, y añadir un valor
   // exigiría un ALTER de tabla; el conjunto cerrado se valida con Zod en la
   // API (REPEAT_UNITS en tasks.schema.ts).
-  repeatUnit        String? @db.VarChar(10)
+  repeatUnit        String?      @db.VarChar(10)
   // Cada cuántas unidades (>= 1). Obligatorio si hay repeatUnit.
   repeatInterval    Int?
   // Máscara de bits de días de la semana, lunes = bit 0 ... domingo = bit 6;
@@ -537,10 +545,10 @@ model Task {
   repeatAnchorDay   Int?
   // Id de la tarea siguiente ya creada por la app. Sin FK a propósito: es un
   // dato del cliente y la sucesora puede llegar después (sincronización).
-  repeatSuccessorId String? @db.Char(36)
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  deletedAt   DateTime?
+  repeatSuccessorId String?      @db.Char(36)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  deletedAt         DateTime?
 
   column        Column         @relation(fields: [columnId], references: [id], onDelete: Cascade)
   // Si se borra el usuario asignado, la tarea sobrevive sin asignar en vez de
@@ -570,15 +578,15 @@ model Task {
 // sincronización pueda comunicar la baja; volver a añadirla reactiva la MISMA
 // fila (unique userId+taskId).
 model MyDayTask {
-  id      String   @id @default(uuid()) @db.Char(36)
-  userId  String   @db.Char(36)
-  taskId  String   @db.Char(36)
-  addedAt DateTime @default(now())
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @db.Char(36)
+  taskId    String    @db.Char(36)
+  addedAt   DateTime  @default(now())
   // Para sincronizar: quitar de Mi día es un soft delete (tombstone), no un
   // borrado físico, y `updatedAt` permite pedir "qué cambió desde X". Toda
   // lectura filtra deletedAt: null. Mi día sigue sin noción de día en el
   // servidor (decisión del producto): `addedAt` es el único dato temporal.
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -622,23 +630,33 @@ model Subtask {
 }
 
 model Reminder {
-  id        String         @id @default(uuid()) @db.Char(36)
-  taskId    String         @db.Char(36)
-  remindAt  DateTime
-  status    ReminderStatus @default(PENDING)
-  sentAt    DateTime?
-  createdAt DateTime       @default(now())
-  // Para la sincronización. Cancelar un recordatorio no borra la fila (pasa a
-  // DISMISSED), así que ese estado ya hace de "borrado lógico" y `updatedAt`
-  // basta para comunicarlo; no hace falta `deletedAt`.
-  updatedAt DateTime       @updatedAt
+  id          String         @id @default(uuid()) @db.Char(36)
+  taskId      String         @db.Char(36)
+  remindAt    DateTime
+  status      ReminderStatus @default(PENDING)
+  sentAt      DateTime?
+  createdAt   DateTime       @default(now())
+  // Para la sincronización: `updatedAt` permite pedir "qué cambió desde X".
+  updatedAt   DateTime       @updatedAt
+  // Borrado lógico para la sync móvil (DELETE por push). Distinto de DISMISSED:
+  // ese estado es "cancelado por el usuario" y sigue siendo visible; deletedAt
+  // oculta la fila de toda lectura. Toda lectura filtra deletedAt: null.
+  deletedAt   DateTime?
+  origin      ReminderOrigin @default(SERVER)
+  // Dueño del recordatorio MOBILE (los SERVER no lo llevan). Sin esto, en un
+  // workspace compartido un recordatorio móvil sería visible para otro miembro.
+  createdById String?        @db.Char(36)
 
-  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task      Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  createdBy User? @relation("ReminderCreator", fields: [createdById], references: [id], onDelete: Cascade)
 
   // Índice pensado exactamente para la query del worker:
   // WHERE status = 'PENDING' AND remindAt <= NOW()
   @@index([status, remindAt])
   @@index([updatedAt])
+  // Sync móvil: los recordatorios MOBILE de un usuario, paginados por updatedAt.
+  // Con createdById primero también sirve a la FK y a su ON DELETE CASCADE.
+  @@index([createdById, origin, updatedAt])
   @@map("reminders")
 }
 

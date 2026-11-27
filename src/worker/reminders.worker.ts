@@ -30,7 +30,9 @@ async function ejecutarCorrida(): Promise<void> {
 
 async function dispararRecordatoriosVencidos(): Promise<void> {
   const vencidos = await prisma.reminder.findMany({
-    where: { status: 'PENDING', remindAt: { lte: new Date() } },
+    // Los recordatorios MOBILE los avisa la propia app en local; el worker no
+    // los notifica (evita el aviso duplicado). Los borrados tampoco.
+    where: { status: 'PENDING', origin: 'SERVER', deletedAt: null, remindAt: { lte: new Date() } },
     include: { task: { include: { column: { include: { board: { include: { workspace: true } } } } } } },
   });
 

@@ -4,6 +4,8 @@ import { AppError } from '../../errors/AppError';
 import { isUniqueConstraintError } from '../../utils/idempotent-create';
 import { boardMutation, columnMutation } from './sync.push.board';
 import { listMutation } from './sync.push.list';
+import { myDayMutation } from './sync.push.myday';
+import { reminderMutation } from './sync.push.reminder';
 import { rejected, toRejected, type Outcome } from './sync.push.shared';
 import { subtaskMutation } from './sync.push.subtask';
 import { taskMutation } from './sync.push.task';
@@ -46,6 +48,10 @@ async function applyMutation(userId: string, m: SyncMutationInput, now: number):
       return taskMutation(userId, m, now);
     case 'subtask':
       return subtaskMutation(userId, m, now);
+    case 'myDay':
+      return myDayMutation(userId, m, now);
+    case 'reminder':
+      return reminderMutation(userId, m, now);
   }
   if (KNOWN_ENTITIES.has(m.entity)) {
     // Entidad del contrato que este despliegue aún no implementa: no se anuncia

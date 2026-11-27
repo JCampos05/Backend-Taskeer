@@ -1,6 +1,7 @@
 import type { WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
+import { idAlreadyInUseError, isUniqueConstraintError } from '../../utils/idempotent-create';
 import type { CreateReminderInput } from './reminders.schema';
 import type { ReminderDto, UpcomingReminderDto } from './reminders.types';
 
@@ -87,6 +88,7 @@ async function requireReminderAccess(reminderId: string, userId: string) {
 
   if (
     !reminder ||
+    reminder.deletedAt !== null ||
     reminder.task.deletedAt !== null ||
     reminder.task.column.board.deletedAt !== null
   ) {
@@ -127,7 +129,8 @@ async function listRemindersByTask(taskId: string, userId: string): Promise<Remi
 
   // Todos los estados, no solo PENDING — el frontend filtra si quiere.
   const reminders = await prisma.reminder.findMany({
-    where: { taskId },
+    // Los recordatorios MOBILE son de quien los creó: nadie más los ve.
+    where: { taskId, deletedAt: null, OR: [{ origin: 'SERVER' }, { createdById: userId }] },
     orderBy: { remindAt: 'asc' },
   });
 
@@ -138,6 +141,11 @@ async function cancelReminder(reminderId: string, userId: string): Promise<Remin
   const { reminder, membership } = await requireReminderAccess(reminderId, userId);
   requireMutationRole(membership);
 
+  // Un recordatorio creado desde el móvil es de quien lo creó: nadie más lo cancela.
+  if (reminder.origin === 'MOBILE' && reminder.createdById !== userId) {
+    throw new AppError(404, 'REMINDER_NOT_FOUND', 'El recordatorio no existe.');
+  }
+
   if (reminder.status !== 'PENDING') {
     throw new AppError(
       400,
@@ -146,9 +154,8 @@ async function cancelReminder(reminderId: string, userId: string): Promise<Remin
     );
   }
 
-  // Nunca se borra la fila — se marca DISMISSED. Reminder no tiene su propio
-  // deletedAt en el schema; este status cumple el mismo rol de "borrado
-  // lógico" para este modelo puntual.
+  // Nunca se borra la fila — se marca DISMISSED (cancelado, sigue visible).
+  // El borrado lógico propio de la sync móvil es `deletedAt`.
   const updated = await prisma.reminder.update({
     where: { id: reminder.id },
     data: { status: 'DISMISSED' },
@@ -168,6 +175,8 @@ async function listUpcomingForUser(userId: string): Promise<UpcomingReminderDto[
   const reminders = await prisma.reminder.findMany({
     where: {
       status: 'PENDING',
+      deletedAt: null,
+      OR: [{ origin: 'SERVER' }, { createdById: userId }],
       task: {
         assigneeId: userId,
         deletedAt: null,
@@ -205,7 +214,88 @@ async function listUpcomingForUser(userId: string): Promise<UpcomingReminderDto[
   }));
 }
 
+// --- Sync móvil (POST /sync/push) ---------------------------------------------
+// Los recordatorios que crea la app llevan origin MOBILE y el dueño que los
+// creó: el worker del backend los ignora (la app los avisa en local) y solo su
+// dueño los ve. Pueden ser varios por tarea. Mismos permisos que mutar la tarea.
+
+interface MobileReminderInput {
+  id: string;
+  remindAt: Date;
+  status: ReminderDto['status'];
+  sentAt: Date | null;
+}
+
+/** Solo el creador toca un recordatorio MOBILE; para cualquier otro, 404 uniforme. */
+function requireOwnMobileReminder(
+  reminder: { origin: string; createdById: string | null },
+  userId: string,
+) {
+  if (reminder.origin !== 'MOBILE' || reminder.createdById !== userId) {
+    throw new AppError(404, 'REMINDER_NOT_FOUND', 'El recordatorio no existe.');
+  }
+}
+
+async function createMobileReminder(taskId: string, userId: string, input: MobileReminderInput) {
+  const { task, membership } = await requireTaskAccess(taskId, userId);
+  requireMutationRole(membership);
+  try {
+    return await prisma.reminder.create({
+      data: {
+        id: input.id,
+        taskId: task.id,
+        remindAt: input.remindAt,
+        status: input.status,
+        sentAt: input.sentAt,
+        origin: 'MOBILE',
+        createdById: userId,
+      },
+    });
+  } catch (err) {
+    // Carrera por el mismo id de cliente: 409 genérico y no un 500.
+    if (isUniqueConstraintError(err)) throw idAlreadyInUseError();
+    throw err;
+  }
+}
+
+async function updateMobileReminder(
+  reminderId: string,
+  userId: string,
+  input: Omit<MobileReminderInput, 'id'>,
+) {
+  const { reminder, membership } = await requireReminderAccess(reminderId, userId);
+  requireMutationRole(membership);
+  requireOwnMobileReminder(reminder, userId);
+  // SENT / DISMISSED son estados finales: no vuelven a PENDING.
+  if (input.status === 'PENDING' && reminder.status !== 'PENDING') {
+    throw new AppError(
+      400,
+      'REMINDER_NOT_PENDING',
+      'Un recordatorio ya enviado o cancelado no puede volver a pendiente.',
+    );
+  }
+  return prisma.reminder.update({
+    where: { id: reminder.id },
+    data: { remindAt: input.remindAt, status: input.status, sentAt: input.sentAt },
+  });
+}
+
+async function deleteMobileReminder(reminderId: string, userId: string): Promise<void> {
+  const { reminder, membership } = await requireReminderAccess(reminderId, userId);
+  requireMutationRole(membership);
+  requireOwnMobileReminder(reminder, userId);
+  // Borrado lógico (tombstone): condicionado a deletedAt null para que dos
+  // borrados simultáneos no pisen la fecha.
+  await prisma.reminder.updateMany({
+    where: { id: reminder.id, deletedAt: null },
+    data: { deletedAt: new Date() },
+  });
+}
+
 export const remindersService = {
+  createMobileReminder,
+  updateMobileReminder,
+  deleteMobileReminder,
   createReminder,
   listRemindersByTask,
   cancelReminder,

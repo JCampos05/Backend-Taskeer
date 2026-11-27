@@ -2,6 +2,8 @@ import type {
   SyncBoardDto,
   SyncColumnDto,
   SyncListDto,
+  SyncMyDayDto,
+  SyncReminderDto,
   SyncSubtaskDto,
   SyncTaskDto,
   SyncWorkspaceDto,
@@ -161,5 +163,43 @@ export function toSyncSubtaskDto(subtask: {
     createdAt: iso(subtask.createdAt),
     updatedAt: iso(subtask.updatedAt),
     deletedAt: isoOrNull(subtask.deletedAt),
+  };
+}
+
+export function toSyncMyDayDto(mark: {
+  taskId: string;
+  addedAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncMyDayDto {
+  return {
+    id: mark.taskId,
+    taskId: mark.taskId,
+    addedAt: iso(mark.addedAt),
+    updatedAt: iso(mark.updatedAt),
+    deletedAt: isoOrNull(mark.deletedAt),
+  };
+}
+
+export function toSyncReminderDto(reminder: {
+  id: string;
+  taskId: string;
+  remindAt: Date;
+  status: SyncReminderDto['status'];
+  sentAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}): SyncReminderDto {
+  return {
+    id: reminder.id,
+    taskId: reminder.taskId,
+    remindAt: iso(reminder.remindAt),
+    status: reminder.status,
+    sentAt: isoOrNull(reminder.sentAt),
+    origin: 'MOBILE',
+    createdAt: iso(reminder.createdAt),
+    updatedAt: iso(reminder.updatedAt),
+    deletedAt: isoOrNull(reminder.deletedAt),
   };
 }

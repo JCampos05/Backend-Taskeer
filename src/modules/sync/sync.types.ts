@@ -104,6 +104,27 @@ export interface SyncSubtaskDto {
   deletedAt: string | null;
 }
 
+export interface SyncMyDayDto {
+  /** Igual que `taskId`: una marca por usuario y tarea. */
+  id: string;
+  taskId: string;
+  addedAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface SyncReminderDto {
+  id: string;
+  taskId: string;
+  remindAt: string;
+  status: 'PENDING' | 'SENT' | 'DISMISSED';
+  sentAt: string | null;
+  origin: 'MOBILE';
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
 export interface SyncChanges {
   workspaces: SyncWorkspaceDto[];
   boardAccess: unknown[];
@@ -112,8 +133,8 @@ export interface SyncChanges {
   columns: SyncColumnDto[];
   tasks: SyncTaskDto[];
   subtasks: SyncSubtaskDto[];
-  myDay: unknown[];
-  reminders: unknown[];
+  myDay: SyncMyDayDto[];
+  reminders: SyncReminderDto[];
 }
 
 export interface SyncChangesResponse {

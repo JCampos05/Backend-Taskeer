@@ -147,3 +147,15 @@ export const subtaskDataSchema = z.object({
 export type BoardData = z.infer<typeof boardDataSchema>;
 export type ColumnData = z.infer<typeof columnDataSchema>;
 export type SubtaskData = z.infer<typeof subtaskDataSchema>;
+
+export const myDayDataSchema = z.object({ addedAt: isoDate });
+
+export const reminderDataSchema = z.object({
+  taskId: uuid,
+  remindAt: isoDate,
+  status: z.enum(['PENDING', 'SENT', 'DISMISSED']),
+  sentAt: isoDate.nullable(),
+});
+
+export type MyDayData = z.infer<typeof myDayDataSchema>;
+export type ReminderData = z.infer<typeof reminderDataSchema>;

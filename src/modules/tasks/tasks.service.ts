@@ -465,7 +465,7 @@ async function updateTask(taskId: string, userId: string, input: UpdateTaskInput
   // dejó atrás.
   if (input.assigneeId !== undefined && input.assigneeId !== task.assigneeId) {
     await prisma.reminder.updateMany({
-      where: { taskId: updated.id },
+      where: { taskId: updated.id, deletedAt: null, origin: 'SERVER' },
       data: { updatedAt: new Date() },
     });
   }
@@ -923,6 +923,40 @@ async function addTaskToMyDay(taskId: string, userId: string): Promise<void> {
   });
 }
 
+/** Sync móvil: alta o renovación de la marca con el `addedAt` del dispositivo
+ * (ya acotado por quien llama). Sin marca → se crea; viva y con un `addedAt`
+ * POSTERIOR → se renueva; viva con uno igual o anterior → no-op (no sube
+ * updatedAt); quitada (tombstone) → se reactiva con ese `addedAt`. Misma
+ * validación de acceso que addTaskToMyDay (cualquier miembro, VIEWER incluido).
+ * Devuelve la fila tal como quedó. */
+async function setMyDayMark(taskId: string, userId: string, addedAt: Date) {
+  await requireTaskAccess(taskId, userId);
+
+  const existing = await prisma.myDayTask.findUnique({
+    where: { userId_taskId: { userId, taskId } },
+  });
+
+  if (!existing) {
+    try {
+      return await prisma.myDayTask.create({ data: { userId, taskId, addedAt } });
+    } catch (err) {
+      // Alta simultánea: gana la otra y se resuelve como si ya existiera.
+      if (!isUniqueConstraintError(err)) throw err;
+      return prisma.myDayTask.findUniqueOrThrow({ where: { userId_taskId: { userId, taskId } } });
+    }
+  }
+
+  if (existing.deletedAt !== null) {
+    await prisma.myDayTask.updateMany({
+      where: { id: existing.id, deletedAt: { not: null } },
+      data: { deletedAt: null, addedAt },
+    });
+  } else if (addedAt.getTime() > existing.addedAt.getTime()) {
+    await prisma.myDayTask.update({ where: { id: existing.id }, data: { addedAt } });
+  }
+  return prisma.myDayTask.findUniqueOrThrow({ where: { id: existing.id } });
+}
+
 /** Idempotente: si no estaba agregada, no hace nada (no es un error) — a
  * diferencia de deleteSubtask, acá no tiene sentido un 404 por "ya no está":
  * el resultado final que le importa al usuario (que no esté en su Mi día)
@@ -993,6 +1027,7 @@ export const tasksService = {
   isTaskInMyDay,
   addTaskToMyDay,
   removeTaskFromMyDay,
+  setMyDayMark,
   listMyDayTasks,
   listAssignedWithDueDate,
   countOverdueForUser,

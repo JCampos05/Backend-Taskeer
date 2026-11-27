@@ -5,6 +5,8 @@ import {
   toSyncBoardDto,
   toSyncColumnDto,
   toSyncListDto,
+  toSyncMyDayDto,
+  toSyncReminderDto,
   toSyncSubtaskDto,
   toSyncTaskDto,
   toSyncWorkspaceDto,
@@ -29,9 +31,17 @@ import {
 // Una entidad no implementada no devuelve datos parciales: sale vacía y no se
 // anuncia en `supportedEntities`.
 
-/** Entidades que este servidor implementa COMPLETAS. H2: listas, tableros,
- * columnas, tareas y subtareas del workspace Personal. */
-export const SUPPORTED_ENTITIES: SyncEntityName[] = ['list', 'board', 'column', 'task', 'subtask'];
+/** Entidades que este servidor implementa COMPLETAS. H4: todas las de push,
+ * acotadas al workspace Personal del usuario. */
+export const SUPPORTED_ENTITIES: SyncEntityName[] = [
+  'list',
+  'board',
+  'column',
+  'task',
+  'subtask',
+  'myDay',
+  'reminder',
+];
 
 // Horizonte de estabilidad. Solo se sirven filas con updatedAt <= ahora - margen.
 // `updatedAt` lo fija la escritura pero la fila solo es visible al COMMIT: una
@@ -115,13 +125,18 @@ function decodeCursor(raw: string, now: number): Cursor {
 
 /** Filas estrictamente DESPUÉS del cursor en el orden (updatedAt, rango, id) y
  * dentro del horizonte de estabilidad, para una entidad de rango `rank`. */
-function seekFor(cursor: Cursor | null, rank: number, horizon: Date) {
+function seekFor(
+  cursor: Cursor | null,
+  rank: number,
+  horizon: Date,
+  idField: 'id' | 'taskId' = 'id',
+) {
   if (!cursor) return { updatedAt: { lte: horizon } };
   const after =
     rank > cursor.r
       ? [{ updatedAt: { gt: cursor.t } }, { updatedAt: cursor.t }]
       : rank === cursor.r
-        ? [{ updatedAt: { gt: cursor.t } }, { updatedAt: cursor.t, id: { gt: cursor.i } }]
+        ? [{ updatedAt: { gt: cursor.t } }, { updatedAt: cursor.t, [idField]: { gt: cursor.i } }]
         : [{ updatedAt: { gt: cursor.t } }];
   return { AND: [{ updatedAt: { lte: horizon } }, { OR: after }] };
 }
@@ -171,7 +186,7 @@ async function getChanges(
   const liveBoard = { workspaceId: personal.id, deletedAt: null };
   const taskScope = { column: { board: liveBoard } };
 
-  const [workspaces, boards, lists, columns, tasks, subtasks] = await Promise.all([
+  const [workspaces, boards, lists, columns, tasks, subtasks, myDay, reminders] = await Promise.all([
     prisma.workspace.findMany({
       where: { AND: [seekFor(cursor, RANK.workspaces, horizon), { id: personal.id }] },
       orderBy: ORDER,
@@ -220,6 +235,30 @@ async function getChanges(
       orderBy: ORDER,
       take,
     }),
+    // SOLO mis marcas de Mi día, de tareas vivas. La marca viaja con `id` =
+    // taskId, así que también se ordena y se pagina por taskId.
+    prisma.myDayTask.findMany({
+      where: {
+        AND: [
+          seekFor(cursor, RANK.myDay, horizon, 'taskId'),
+          { userId, task: { ...taskScope, deletedAt: null } },
+        ],
+      },
+      orderBy: [{ updatedAt: 'asc' }, { taskId: 'asc' }],
+      take,
+    }),
+    // SOLO los recordatorios que yo creé desde el móvil, de tareas vivas. Los
+    // creados desde la web (origin SERVER) no se sincronizan en v1.
+    prisma.reminder.findMany({
+      where: {
+        AND: [
+          seekFor(cursor, RANK.reminders, horizon),
+          { origin: 'MOBILE', createdById: userId, task: { ...taskScope, deletedAt: null } },
+        ],
+      },
+      orderBy: ORDER,
+      take,
+    }),
   ]);
 
   const tag = (key: SyncChangeKey, r: { id: string; updatedAt: Date }, dto: unknown): Tagged => ({
@@ -239,6 +278,8 @@ async function getChanges(
       tag('tasks', r, toSyncTaskDto(r, { id: r.column.boardId, isList: r.column.board.isList })),
     ),
     ...subtasks.map((r) => tag('subtasks', r, toSyncSubtaskDto(r))),
+    ...myDay.map((r) => tag('myDay', { id: r.taskId, updatedAt: r.updatedAt }, toSyncMyDayDto(r))),
+    ...reminders.map((r) => tag('reminders', r, toSyncReminderDto(r))),
   ];
 
   merged.sort(compareTagged);
@@ -246,7 +287,7 @@ async function getChanges(
 
   // Hay más si la mezcla excedió el límite, o si alguna entidad llenó su
   // ventana de limit + 1 (pudo quedarse con filas fuera de la consulta).
-  const hasMore = merged.length > limit || [workspaces, boards, lists, columns, tasks, subtasks].some((rows) => rows.length > limit);
+  const hasMore = merged.length > limit || [workspaces, boards, lists, columns, tasks, subtasks, myDay, reminders].some((rows) => rows.length > limit);
 
   // Con hasMore el cursor avanza hasta la última fila SERVIDA. Sin hasMore todo
   // lo anterior al horizonte ya se sirvió, así que el cursor salta al horizonte
