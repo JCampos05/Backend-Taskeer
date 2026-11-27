@@ -34,6 +34,33 @@ export async function buildWorkspaceRevocationEvents(
   ];
 }
 
+/** Un workspace se borró: cada miembro pierde cada tablero normal vivo. No se
+ * emite el evento del workspace (boardId nulo): su tombstone ya sale de las
+ * membresías, que `deleteWorkspace` conserva. */
+export async function buildWorkspaceDeletionEvents(
+  db: Db,
+  workspaceId: string,
+): Promise<Prisma.AccessEventCreateManyInput[]> {
+  const [members, boards] = await Promise.all([
+    db.workspaceMember.findMany({ where: { workspaceId }, select: { userId: true, role: true } }),
+    db.board.findMany({
+      where: { workspaceId, isList: false, deletedAt: null },
+      select: { id: true },
+    }),
+  ]);
+  return members.flatMap((m) =>
+    boards.map(
+      (b): Prisma.AccessEventCreateManyInput => ({
+        userId: m.userId,
+        workspaceId,
+        boardId: b.id,
+        kind: 'REVOKED',
+        role: m.role,
+      }),
+    ),
+  );
+}
+
 /** `userId` ganó acceso a un workspace entero (alta de miembro). Fuerza un
  * snapshot en sus dispositivos: el contenido viejo del workspace ya quedó detrás
  * de su cursor y no volvería a emitirse de otra forma. */

@@ -1,5 +1,9 @@
 import { randomBytes, createHash } from 'node:crypto';
-import { buildWorkspaceRevocationEvents, recordWorkspaceGrant } from '../../utils/access-events';
+import {
+  buildWorkspaceDeletionEvents,
+  buildWorkspaceRevocationEvents,
+  recordWorkspaceGrant,
+} from '../../utils/access-events';
 import type { InvitationStatus, WorkspaceMember, WorkspaceRole } from '@prisma/client';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
@@ -300,20 +304,25 @@ async function deleteWorkspace(workspaceId: string, userId: string): Promise<voi
     );
   }
 
-  await prisma.$transaction([
+  await prisma.$transaction(async (tx) => {
+    // Sync móvil: los miembros dejan de ver los tableros del workspace; sin este
+    // evento la app no sabría retirarlos (el tombstone del workspace no cascada).
+    const revocationEvents = await buildWorkspaceDeletionEvents(tx, workspaceId);
+
     // Soft delete — nunca DELETE directo (docs/02-modelo-datos.md).
-    prisma.workspace.update({
+    await tx.workspace.update({
       where: { id: workspaceId },
       data: { deletedAt: new Date() },
-    }),
-    prisma.auditLog.create({
+    });
+    await tx.accessEvent.createMany({ data: revocationEvents });
+    await tx.auditLog.create({
       data: {
         userId,
         action: 'workspace.deleted',
         metadata: { workspaceId },
       },
-    }),
-  ]);
+    });
+  });
 }
 
 async function listMembers(workspaceId: string, userId: string): Promise<WorkspaceMemberDto[]> {
