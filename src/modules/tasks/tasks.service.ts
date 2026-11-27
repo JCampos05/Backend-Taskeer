@@ -549,12 +549,13 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
       const clampedPosition = Math.max(0, Math.min(input.position, withoutMoved.length));
       withoutMoved.splice(clampedPosition, 0, task);
 
+      // Solo las filas cuya posición cambia: cada update sube `updatedAt`, y
+      // tocar las demás inflaría la sync y provocaría conflictos espurios.
       await Promise.all(
-        withoutMoved.map((sibling, index) =>
-          tx.task.update({
-            where: { id: sibling.id },
-            data: { position: index },
-          }),
+        withoutMoved.flatMap((sibling, index) =>
+          sibling.position === index
+            ? []
+            : [tx.task.update({ where: { id: sibling.id }, data: { position: index } })],
         ),
       );
 
@@ -574,17 +575,23 @@ async function moveTask(taskId: string, userId: string, input: MoveTaskInput): P
     destinationSiblings.splice(clampedPosition, 0, task);
 
     await Promise.all([
-      ...sourceSiblings.map((sibling, index) =>
-        tx.task.update({ where: { id: sibling.id }, data: { position: index } }),
+      ...sourceSiblings.flatMap((sibling, index) =>
+        sibling.position === index
+          ? []
+          : [tx.task.update({ where: { id: sibling.id }, data: { position: index } })],
       ),
-      ...destinationSiblings.map((sibling, index) =>
-        tx.task.update({
-          where: { id: sibling.id },
-          data: {
-            position: index,
-            ...(sibling.id === taskId ? { columnId: destinationColumn.id } : {}),
-          },
-        }),
+      ...destinationSiblings.flatMap((sibling, index) =>
+        sibling.id !== taskId && sibling.position === index
+          ? []
+          : [
+              tx.task.update({
+                where: { id: sibling.id },
+                data: {
+                  position: index,
+                  ...(sibling.id === taskId ? { columnId: destinationColumn.id } : {}),
+                },
+              }),
+            ],
       ),
     ]);
 
