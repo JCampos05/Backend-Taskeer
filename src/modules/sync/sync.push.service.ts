@@ -3,10 +3,19 @@ import { prisma } from '../../config/prisma';
 import { AppError } from '../../errors/AppError';
 import { isUniqueConstraintError } from '../../utils/idempotent-create';
 import { boardMutation, columnMutation } from './sync.push.board';
+import {
+  toSyncBoardDto,
+  toSyncColumnDto,
+  toSyncListDto,
+  toSyncMyDayDto,
+  toSyncReminderDto,
+  toSyncSubtaskDto,
+  toSyncTaskDto,
+} from './sync.mappers';
 import { listMutation } from './sync.push.list';
 import { myDayMutation } from './sync.push.myday';
 import { reminderMutation } from './sync.push.reminder';
-import { rejected, toRejected, type Outcome } from './sync.push.shared';
+import { memberWorkspaceIds, rejected, toRejected, type Outcome } from './sync.push.shared';
 import { subtaskMutation } from './sync.push.subtask';
 import { taskMutation } from './sync.push.task';
 import type { SyncMutationInput } from './sync.schema';
@@ -68,6 +77,75 @@ const STATUS_DB: Record<SyncPushStatus, SyncMutationStatus> = {
   rejected: 'REJECTED',
 };
 
+/** Registro vigente de `m.id` si existe y el usuario puede verlo (mismos
+ * límites de visibilidad que el resto del push); `null` si no existe o es
+ * ajeno, para no revelar su existencia. */
+async function visibleRecord(userId: string, m: SyncMutationInput): Promise<unknown> {
+  const memberOf = await memberWorkspaceIds(userId);
+  switch (m.entity) {
+    case 'task': {
+      const task = await prisma.task.findUnique({
+        where: { id: m.id },
+        include: {
+          column: {
+            select: { boardId: true, board: { select: { workspaceId: true, isList: true } } },
+          },
+        },
+      });
+      if (!task || !memberOf.has(task.column.board.workspaceId)) return null;
+      return toSyncTaskDto(task, { id: task.column.boardId, isList: task.column.board.isList });
+    }
+    case 'column': {
+      const column = await prisma.column.findUnique({
+        where: { id: m.id },
+        include: { board: { select: { workspaceId: true, isList: true } } },
+      });
+      if (!column || column.board.isList || !memberOf.has(column.board.workspaceId)) return null;
+      return toSyncColumnDto(column);
+    }
+    case 'board':
+    case 'list': {
+      const board = await prisma.board.findUnique({ where: { id: m.id } });
+      if (!board || board.isList !== (m.entity === 'list') || !memberOf.has(board.workspaceId)) {
+        return null;
+      }
+      return m.entity === 'list' ? toSyncListDto(board) : toSyncBoardDto(board);
+    }
+    case 'subtask': {
+      const subtask = await prisma.subtask.findUnique({
+        where: { id: m.id },
+        include: {
+          task: { select: { column: { select: { board: { select: { workspaceId: true } } } } } },
+        },
+      });
+      if (!subtask || !memberOf.has(subtask.task.column.board.workspaceId)) return null;
+      return toSyncSubtaskDto(subtask);
+    }
+    case 'reminder': {
+      const reminder = await prisma.reminder.findUnique({
+        where: { id: m.id },
+        include: {
+          task: { select: { column: { select: { board: { select: { workspaceId: true } } } } } },
+        },
+      });
+      const mine =
+        reminder !== null &&
+        reminder.origin === 'MOBILE' &&
+        reminder.createdById === userId &&
+        memberOf.has(reminder.task.column.board.workspaceId);
+      return mine ? toSyncReminderDto(reminder) : null;
+    }
+    case 'myDay': {
+      const mark = await prisma.myDayTask.findUnique({
+        where: { userId_taskId: { userId, taskId: m.id } },
+      });
+      return mark ? toSyncMyDayDto(mark) : null;
+    }
+    default:
+      return null;
+  }
+}
+
 async function processOne(userId: string, m: SyncMutationInput): Promise<SyncPushResult> {
   const stored = await prisma.syncMutation.findUnique({
     where: { userId_clientMutationId: { userId, clientMutationId: m.clientMutationId } },
@@ -82,8 +160,12 @@ async function processOne(userId: string, m: SyncMutationInput): Promise<SyncPus
     // otro error (5xx, base caída...) NO se guarda ni se devuelve como
     // `rejected`: se relanza y toda la petición responde 5xx; el reenvío
     // devolverá lo ya guardado y reintentará el resto (§5.2).
-    if (err instanceof AppError && err.statusCode < 500) outcome = toRejected(err);
-    else throw err;
+    if (err instanceof AppError && err.statusCode < 500) {
+      outcome = toRejected(err);
+      // §5.2: si la entidad ya existe y el usuario la ve, el rechazo trae el
+      // registro vigente para que el cliente revierta.
+      if (outcome.record === null) outcome.record = await visibleRecord(userId, m);
+    } else throw err;
   }
 
   const result: SyncPushResult = {
