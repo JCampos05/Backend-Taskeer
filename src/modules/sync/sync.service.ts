@@ -327,7 +327,7 @@ async function getChanges(
       // (los de mis workspaces), así que el rol efectivo se calcula en memoria.
       prisma.board.findMany({
         where: { workspaceId: { in: W }, isList: false, deletedAt: null },
-        select: { id: true, workspaceId: true, createdAt: true },
+        select: { id: true, workspaceId: true, createdAt: true, updatedAt: true },
       }),
       prisma.boardMemberOverride.findMany({
         where: { userId, board: { workspaceId: { in: W }, isList: false, deletedAt: null } },
@@ -377,7 +377,9 @@ async function getChanges(
       const m = roleByWorkspace.get(b.workspaceId);
       if (!m) return [];
       const o = overrideByBoard.get(b.id);
-      const updatedAt = maxDate(m.updatedAt, o?.updatedAt, b.createdAt);
+      // `b.updatedAt` sube al mover el tablero de workspace: quien conserva el
+      // acceso recibe el `workspaceId` y el rol nuevos.
+      const updatedAt = maxDate(m.updatedAt, o?.updatedAt, b.createdAt, b.updatedAt);
       return [
         {
           id: b.id,
